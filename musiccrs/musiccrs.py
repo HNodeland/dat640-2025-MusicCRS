@@ -1,72 +1,55 @@
-"""MusicCRS conversational agent with playlist + MPD validation.
+"""MusicCRS — original features + paging + reduced Spotify reliance.
 
-Keeps original template commands:
-  /info
-  /ask_llm <prompt>
-  /options
-  /quit
-
-Adds playlist commands (R2):
-  /help
-  /add [artist]: [title]
-  /remove [index|track_uri]
-  /view
-  /clear
-  /create [playlist_name]
-  /switch [playlist_name]
-  /list
-
-Adds R3 commands:
-  /add [title]  (search by title only)
-  /ask [question]  (Q&A about tracks/artists)
-  /stats  (playlist statistics)
+Adds: /ask help — lists all supported question types for /ask.
+(Also keeps earlier fixes: paging, popularity formatting, single-playlist payload, INFORM acts.)
 """
 
 from __future__ import annotations
+import json, os, re
+from typing import Optional, List, Tuple
 
-import os
-import json
-import re
-from typing import List
+try:
+    import ollama
+except Exception:
+    ollama = None
 
-import ollama
 from dotenv import load_dotenv
-
 from dialoguekit.core.annotated_utterance import AnnotatedUtterance
 from dialoguekit.core.dialogue_act import DialogueAct
 from dialoguekit.core.intent import Intent
 from dialoguekit.core.slot_value_annotation import SlotValueAnnotation
-from dialoguekit.core.utterance import Utterance
-from dialoguekit.participant.agent import Agent
 from dialoguekit.participant.participant import DialogueParticipant
 from dialoguekit.platforms import FlaskSocketPlatform
+from dialoguekit.participant.agent import Agent
 
 from .playlist_service import PlaylistService
 from .qa_system import QASystem
 
-# Load environment variables from '.env' file
 load_dotenv()
-
 OLLAMA_HOST = os.getenv("OLLAMA_HOST")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
 _INTENT_OPTIONS = Intent("OPTIONS")
-_INTENT_DISAMBIGUATE = Intent("DISAMBIGUATE")
+_INTENT_INFORM = Intent("INFORM")
 
-# ---------- helpers for the playlist UI sync ----------
-def _playlist_marker(payload: dict | None) -> str:
-    """Encode playlist payload in a hidden HTML comment the frontend can parse."""
-    if not payload:
+def _playlist_marker_from_obj(playlist_obj: dict | None) -> str:
+    if not playlist_obj:
         return ""
-    return f"<!--PLAYLIST:{json.dumps(payload, separators=(',', ':'))}-->"
+    return f"<!--PLAYLIST:{json.dumps(playlist_obj, separators=(',', ':'))}-->"
 
+def _format_pop_k(n: int) -> str:
+    v = (n or 0) / 1000.0
+    s = f"{v:.1f}"
+    if s.endswith(".0"):
+        s = s[:-2]
+    return f"{s}k"
+
+_NUMBER_ONLY = re.compile(r"^\s*(\d+)\s*[\.)]?\s*$")
 
 class MusicCRS(Agent):
     def __init__(self, use_llm: bool = True):
-        """Initialize MusicCRS agent compatible with your DialogueKit template."""
         super().__init__(id="MusicCRS")
-
         if use_llm and OLLAMA_HOST and OLLAMA_MODEL:
             self._llm = ollama.Client(
                 host=OLLAMA_HOST,
@@ -75,187 +58,162 @@ class MusicCRS(Agent):
         else:
             self._llm = None
 
-        # --- R2 state ---
         self._ps = PlaylistService()
-        # If you later expose per-session IDs, replace this with the session/user id.
+        self._qa = QASystem()
         self._user_key = "default"
 
-        # --- R3 state ---
-        self._qa = QASystem()
-        self._pending_disambiguation = None  # Stores disambiguation state: {'type': 'add'|'qa', 'options': [...], 'context': {...}}
+        self._disambig: Optional[dict] = None  # {'query','rows','page','page_size'}
 
-        # Pre-compiled command regexes
-        self._cmd_add = re.compile(r"^/add\s+([^:]+)\s*:\s*(.+)$", re.IGNORECASE)
-        self._cmd_add_title = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
-        self._cmd_remove = re.compile(r"^/remove\s+(.+)$", re.IGNORECASE)
-        self._cmd_view = re.compile(r"^/view$", re.IGNORECASE)
-        self._cmd_clear = re.compile(r"^/clear$", re.IGNORECASE)
-        self._cmd_create = re.compile(r"^/create\s+(.+)$", re.IGNORECASE)
-        self._cmd_switch = re.compile(r"^/switch\s+(.+)$", re.IGNORECASE)
-        self._cmd_list = re.compile(r"^/list$", re.IGNORECASE)
-        self._cmd_help = re.compile(r"^/help$|^/options$", re.IGNORECASE)
-        self._cmd_ask = re.compile(r"^/ask\s+(.+)$", re.IGNORECASE)
-        self._cmd_stats = re.compile(r"^/stats$", re.IGNORECASE)
-        self._cmd_play = re.compile(r"^/play(?:\s+(\d+))?$", re.IGNORECASE)  # R3.6: Play/preview
-        self._cmd_preview = re.compile(r"^/preview\s+(.+)$", re.IGNORECASE)  # R3.6: Preview by search
+        # commands
+        self._cmd_add_exact = re.compile(r"^/add\s+([^:]+)\s*:\s*(.+)$", re.IGNORECASE)
+        self._cmd_add_any   = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
+        self._cmd_remove    = re.compile(r"^/remove\s+(.+)$", re.IGNORECASE)
+        self._cmd_view      = re.compile(r"^/view$", re.IGNORECASE)
+        self._cmd_clear     = re.compile(r"^/clear$", re.IGNORECASE)
+        self._cmd_create    = re.compile(r"^/create\s+(.+)$", re.IGNORECASE)
+        self._cmd_switch    = re.compile(r"^/switch\s+(.+)$", re.IGNORECASE)
+        self._cmd_list      = re.compile(r"^/list$", re.IGNORECASE)
+        self._cmd_help      = re.compile(r"^/help$|^/options$", re.IGNORECASE)
+        self._cmd_ask       = re.compile(r"^/ask\s+(.+)$", re.IGNORECASE)
+        self._cmd_ask_help  = re.compile(r"^/ask\s+help\s*$", re.IGNORECASE)  # NEW
+        self._cmd_stats     = re.compile(r"^/stats$", re.IGNORECASE)
+        self._cmd_play      = re.compile(r"^/play(?:\s+(\d+))?$", re.IGNORECASE)
+        self._cmd_preview   = re.compile(r"^/preview\s+(.+)$", re.IGNORECASE)
 
-    # ---------- DialogueKit lifecycle ----------
+        # paging
+        self._cmd_next      = re.compile(r"^/(?:next|more)$", re.IGNORECASE)
+        self._cmd_prev      = re.compile(r"^/(?:prev|previous|back)$", re.IGNORECASE)
+        self._cmd_page      = re.compile(r"^/page\s+(\d+)$", re.IGNORECASE)
+
+    # lifecycle
     def welcome(self) -> None:
-        """Sends the agent's welcome message."""
         self._send_text("Hello, I'm MusicCRS. Type /help to see what I can do.")
 
     def goodbye(self) -> None:
-        """Quits the conversation."""
-        self._send_text(
-            "It was nice talking to you. Bye",
-            dialogue_acts=[DialogueAct(intent=self.stop_intent)],
-        )
+        self._send_text("It was nice talking to you. Bye")
 
-    # ---------- main dispatcher ----------
-    def receive_utterance(self, utterance: Utterance) -> None:
-        """Gets called each time there is a new user utterance (template-compatible)."""
+    # dispatcher
+    def receive_utterance(self, utterance) -> None:
         text = (utterance.text or "").strip()
         if not text:
             return
-
         try:
-            # Handle numeric selections for disambiguation (R3.1)
-            if self._pending_disambiguation and text.isdigit():
-                self._handle_disambiguation_selection(int(text))
-                return
+            # numeric choice during disambiguation
+            if self._disambig:
+                mnum = _NUMBER_ONLY.match(text)
+                if mnum:
+                    self._handle_disambig_choice(int(mnum.group(1)))
+                    return
 
-            # Original template commands
             if text.startswith("/info"):
                 self._send_text(self._info(), include_playlist=False)
                 return
-
             if text.startswith("/ask_llm "):
                 prompt = text[9:]
                 self._send_text(self._ask_llm(prompt), include_playlist=False)
                 return
-
             if text.startswith("/options"):
-                options = [
-                    "Play some jazz music",
-                    "Recommend me some pop songs",
-                    "Create a workout playlist",
-                ]
+                options = ["Play some jazz music", "Recommend me some pop songs", "Create a workout playlist"]
                 self._send_options(options)
                 return
-
             if text == "/quit":
                 self.goodbye()
                 return
 
-            # --- R3 commands (before R2 to handle /add with just title) ---
-            
-            # R3.3: Q&A system
-            if m := self._cmd_ask.match(text):
-                question = m.group(1).strip()
-                answer = self._qa.answer_question(question)
-                
-                if answer is None:
-                    self._send_text("I'm sorry, I don't understand that question. Try asking about tracks or artists.", include_playlist=False)
-                elif isinstance(answer, dict) and answer.get('type') == 'disambiguate':
-                    # Handle disambiguation for QA questions
-                    self._handle_qa_disambiguation(answer)
-                else:
-                    # Direct answer
-                    self._send_text(answer, include_playlist=False)
+            # paging
+            if self._cmd_next.match(text):
+                self._paginate(+1)
+                return
+            if self._cmd_prev.match(text):
+                self._paginate(-1)
+                return
+            if m := self._cmd_page.match(text):
+                page = max(1, int(m.group(1)))
+                self._paginate(0, set_to=page - 1)
                 return
 
-            # R3.5: Playlist statistics
-            if self._cmd_stats.match(text):
-                stats = self._ps.get_playlist_stats(self._user_key)
-                html = self._format_stats(stats)
-                self._send_playlist_text(html)
-                return
-            
-            # R3.6: Play/preview commands
+            # playback/preview
             if m := self._cmd_play.match(text):
                 track_num = m.group(1)
                 self._handle_play(int(track_num) if track_num else None)
                 return
-            
             if m := self._cmd_preview.match(text):
                 query = m.group(1).strip()
                 self._handle_preview_search(query)
                 return
 
-            # --- R2 playlist commands ---
-            
-            # R3.1 Enhanced: Parse natural language patterns for /add
-            # Support: "title by artist", "artist - title", "artist: title"
-            if text.startswith("/add "):
-                query = text[5:].strip()  # Remove "/add " prefix
-                
+            # --- ASK HELP (new) ---
+            if self._cmd_ask_help.match(text):
+                self._send_text(self._qa.help_text(), include_playlist=False)
+                return
+
+            if self._cmd_stats.match(text):
+                stats = self._ps.get_playlist_stats(self._user_key)
+                html = self._format_stats(stats)
+                self._send_playlist_text(html)
+                return
+
+            if m := self._cmd_ask.match(text):
+                q = m.group(1).strip()
+                ans = self._qa.answer_question(q)
+                self._send_text(ans, include_playlist=False)
+                return
+
+            # playlist ops
+            if m := self._cmd_add_exact.match(text):
+                artist = m.group(1).strip()
+                title = m.group(2).strip()
+                track = self._ps.add_track_by_artist_title(self._user_key, artist, title)
+                self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+                return
+
+            if m := self._cmd_add_any.match(text):
+                query = m.group(1).strip()
                 artist = None
                 title = None
-                
-                # Pattern 1: "artist: title" (original format)
                 if ":" in query:
-                    m = self._cmd_add.match(text)
-                    if m:
-                        artist = m.group(1).strip()
-                        title = m.group(2).strip()
-                
-                # Pattern 2: "title by artist" (natural language)
-                elif " by " in query.lower():
-                    # Split on " by " case-insensitively
-                    parts = query.lower().split(" by ")
-                    if len(parts) == 2:
-                        # Get original case versions
-                        idx = query.lower().index(" by ")
-                        title = query[:idx].strip()
-                        artist = query[idx + 4:].strip()  # +4 for " by "
-                
-                # Pattern 3: "artist - title" (common format)
-                elif " - " in query:
+                    parts = query.split(":", 1)
+                    if parts[0].strip() and parts[1].strip():
+                        artist, title = parts[0].strip(), parts[1].strip()
+                if not (artist and title) and " by " in query.lower():
+                    idx = query.lower().index(" by ")
+                    title, artist = query[:idx].strip(), query[idx + 4 :].strip()
+                if not (artist and title) and " - " in query:
                     parts = query.split(" - ", 1)
                     if len(parts) == 2:
-                        artist = parts[0].strip()
-                        title = parts[1].strip()
-                
-                # If artist and title are parsed, search by both
+                        artist, title = parts[0].strip(), parts[1].strip()
+
                 if artist and title:
-                    # Try exact match first
-                    from .playlist_db import get_track
-                    track_data = get_track(artist, title)
-                    if track_data:
-                        track = self._ps.add_by_uri(self._user_key, track_data[0])
+                    from .playlist_db import get_track, search_by_artist_title_fuzzy
+                    row = get_track(artist, title)
+                    if row:
+                        track = self._ps.add_by_uri(self._user_key, row[0])
                         self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
                         return
-                    else:
-                        # Try fuzzy search
-                        from .playlist_db import search_by_artist_title_fuzzy
-                        fuzzy_results = search_by_artist_title_fuzzy(artist, title, limit=10)
-                        if fuzzy_results:
-                            if len(fuzzy_results) == 1:
-                                track = self._ps.add_by_uri(self._user_key, fuzzy_results[0][0])
-                                self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
-                                return
-                            else:
-                                # Multiple fuzzy matches, show disambiguation
-                                self._handle_disambiguation(f"{artist} - {title}", fuzzy_results)
-                                return
+                    fuzzy = search_by_artist_title_fuzzy(artist, title, limit=10)
+                    if fuzzy:
+                        if len(fuzzy) == 1:
+                            track = self._ps.add_by_uri(self._user_key, fuzzy[0][0])
+                            self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
                         else:
-                            self._send_text(f"No tracks found with artist <b>{artist}</b> and title <b>{title}</b>.", include_playlist=False)
-                            return
-                
-                # Pattern 4: Title only (fallback)
-                else:
-                    title = query
-                    results = self._ps.search_tracks_by_title(self._user_key, title)
-                    if not results:
-                        self._send_text(f"No tracks found with title <b>{title}</b>.", include_playlist=False)
-                    elif len(results) == 1:
-                        # Only one match, add it directly
-                        track = self._ps.add_by_uri(self._user_key, results[0][0])
-                        self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
-                    else:
-                        # Multiple matches, ask user to choose (R3.1 disambiguation)
-                        self._handle_disambiguation(title, results)
+                            self._start_disambiguation(f"{artist} - {title}", fuzzy)
+                        return
+                    self._send_text(
+                        f"No tracks found with artist <b>{artist}</b> and title <b>{title}</b>.",
+                        include_playlist=False,
+                    )
                     return
+
+                title = query
+                full_rows = self._ps.search_tracks_by_title(self._user_key, title, fetch_all=True)
+                if not full_rows:
+                    self._send_text(f"No tracks found with title <b>{title}</b>.", include_playlist=False)
+                elif len(full_rows) == 1:
+                    track = self._ps.add_by_uri(self._user_key, full_rows[0][0])
+                    self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+                else:
+                    self._start_disambiguation(title, full_rows)
+                return
 
             if m := self._cmd_remove.match(text):
                 ident = m.group(1).strip()
@@ -267,9 +225,9 @@ class MusicCRS(Agent):
                 pl = self._ps.current_playlist(self._user_key)
                 if pl.tracks:
                     lines = "".join([f"<li>{i+1}. {t.artist} – {t.title}</li>" for i, t in enumerate(pl.tracks)])
-                    html = f"<b>{pl.name}</b> ({len(pl.tracks)} tracks)<ol>{lines}</ol>"
+                    html = f"Playlist <b>{pl.name}</b> ({len(pl.tracks)} tracks):<ol>{lines}</ol>"
                 else:
-                    html = f"<b>{pl.name}</b> is empty."
+                    html = f"Playlist <b>{pl.name}</b> is empty."
                 self._send_playlist_text(html)
                 return
 
@@ -300,13 +258,12 @@ class MusicCRS(Agent):
                 self._send_playlist_text(self._help_text())
                 return
 
-            # Fallback if unknown
             self._send_text("I'm sorry, I don't understand that command. Type /help.", include_playlist=False)
 
         except Exception as e:
             self._send_text(f"Error: {str(e)}", include_playlist=False)
 
-    # ---------- Original template helpers ----------
+    # helpers
     def _info(self) -> str:
         return "I am MusicCRS, a conversational recommender system for music."
 
@@ -316,320 +273,31 @@ class MusicCRS(Agent):
         llm_response = self._llm.generate(
             model=OLLAMA_MODEL,
             prompt=prompt,
-            options={
-                "stream": False,
-                "temperature": 0.7,
-                "max_tokens": 100,
-            },
+            options={"stream": False, "temperature": 0.7, "max_tokens": 100},
         )
-        return f"LLM response: {llm_response['response']}"
+        try:
+            return llm_response["response"]
+        except Exception:
+            return str(llm_response)
 
-    def _send_options(self, options: list[str]) -> None:
-        """Mimic your template /options with dialogue_acts for quick-replies."""
-        response = (
-            "Here are some options:\n<ol>\n"
-            + "\n".join([f"<li>{option}</li>" for option in options])
-            + "</ol>\n"
-        )
+    def _send_options(self, options: List[str]) -> None:
         dialogue_acts = [
             DialogueAct(
                 intent=_INTENT_OPTIONS,
-                annotations=[SlotValueAnnotation("option", option) for option in options],
+                annotations=[SlotValueAnnotation("option", o) for o in options],
             )
         ]
-        self._send_text(response, include_playlist=False, dialogue_acts=dialogue_acts)
+        self._send_text("Here are some options:", include_playlist=False, dialogue_acts=dialogue_acts)
 
-    # ---------- R2 helpers ----------
-    def _help_text(self) -> str:
-        return (
-            "I can manage playlists for you. Use these commands:<br/>"
-            "<ul>"
-            "<li><code>/add [title]</code> &mdash; add a song by title (I'll help you choose if multiple matches)</li>"
-            "<li><code>/add [title] by [artist]</code> &mdash; natural language format</li>"
-            "<li><code>/add [artist] - [title]</code> &mdash; dash-separated format</li>"
-            "<li><code>/add [artist]: [title]</code> &mdash; colon-separated format</li>"
-            "<li><code>/remove [index|track_uri]</code> &mdash; remove by 1-based index or track URI</li>"
-            "<li><code>/view</code> &mdash; show current playlist</li>"
-            "<li><code>/clear</code> &mdash; remove all tracks</li>"
-            "<li><code>/create [name]</code> &mdash; create and switch to a new playlist</li>"
-            "<li><code>/switch [name]</code> &mdash; switch current playlist</li>"
-            "<li><code>/list</code> &mdash; list your playlists</li>"
-            "<li><code>/ask [question]</code> &mdash; ask about tracks or artists</li>"
-            "<li><code>/stats</code> &mdash; show playlist statistics</li>"
-            "<li><code>/play [number]</code> &mdash; get Spotify link for a track in your playlist</li>"
-            "<li><code>/preview [artist/title]</code> &mdash; search for a track preview</li>"
-            "</ul>"
-            "Tip: songs must exist in the database. You can use natural formats like <code>Hey Jude by The Beatles</code> or <code>The Beatles - Hey Jude</code>."
-        )
-
-    # ---------- R3 helpers ----------
-    def _handle_disambiguation(self, title: str, results: list) -> None:
-        """Present disambiguation options to user (R3.1)."""
-        self._pending_disambiguation = {
-            'type': 'add',
-            'options': results,
-            'context': {'title': title, 'action': 'add track'}
-        }
-        
-        # Limit to first 10 results
-        display_results = results[:10]
-        
-        html = f"I found <b>{len(results)}</b> tracks with the title <b>{title}</b>. Please choose:<br/><ol>"
-        for i, (uri, artist, track_title, album) in enumerate(display_results, 1):
-            album_text = f" (from <i>{album}</i>)" if album else ""
-            html += f"<li><b>{artist}</b> – {track_title}{album_text}</li>"
-        html += "</ol>"
-        
-        if len(results) > 10:
-            html += f"<br/><i>Showing first 10 of {len(results)} results.</i><br/>"
-        
-        html += "Type the number to add that track."
-        
-        # Create options for the dialogue acts
-        options = [f"{i}. {results[i-1][1]} – {results[i-1][2]}" for i in range(1, min(len(results) + 1, 11))]
-        
-        dialogue_acts = [
-            DialogueAct(
-                intent=_INTENT_DISAMBIGUATE,
-                annotations=[SlotValueAnnotation("option", opt) for opt in options],
-            )
-        ]
-        
-        self._send_text(html, include_playlist=False, dialogue_acts=dialogue_acts)
-    
-    def _handle_qa_disambiguation(self, disambiguation_result: dict) -> None:
-        """Present disambiguation options for QA questions (R3.3)."""
-        options = disambiguation_result['options']
-        context = disambiguation_result['context']
-        question_type = disambiguation_result.get('question_type', 'track_info')
-        
-        self._pending_disambiguation = {
-            'type': 'qa',
-            'options': options,
-            'context': {
-                **context,
-                'question_type': question_type
-            }
-        }
-        
-        # Limit to first 10 results
-        display_results = options[:10]
-        
-        artist_query = context.get('artist', '')
-        title_query = context.get('title', '')
-        
-        html = f"I found <b>{len(options)}</b> tracks matching <b>{title_query}</b> by <b>{artist_query}</b>. Which one did you mean?<br/><ol>"
-        for i, (uri, artist, track_title, album) in enumerate(display_results, 1):
-            album_text = f" (from <i>{album}</i>)" if album else ""
-            html += f"<li><b>{artist}</b> – {track_title}{album_text}</li>"
-        html += "</ol>"
-        
-        if len(options) > 10:
-            html += f"<br/><i>Showing first 10 of {len(options)} results.</i><br/>"
-        
-        html += "Type the number to select that track."
-        
-        # Create options for the dialogue acts
-        option_strs = [f"{i}. {options[i-1][1]} – {options[i-1][2]}" for i in range(1, min(len(options) + 1, 11))]
-        
-        dialogue_acts = [
-            DialogueAct(
-                intent=_INTENT_DISAMBIGUATE,
-                annotations=[SlotValueAnnotation("option", opt) for opt in option_strs],
-            )
-        ]
-        
-        self._send_text(html, include_playlist=False, dialogue_acts=dialogue_acts)
-    
-    def _handle_disambiguation_selection(self, choice: int) -> None:
-        """Handle user's selection from disambiguation options (R3.1 and R3.3)."""
-        if not self._pending_disambiguation:
-            self._send_text("No pending selection. Use <code>/add [title]</code> or <code>/ask</code> to get options.", include_playlist=False)
-            return
-        
-        # Get disambiguation type and options
-        if isinstance(self._pending_disambiguation, dict):
-            # New format: {'type': 'add'|'qa', 'options': [...], 'context': {...}}
-            dtype = self._pending_disambiguation.get('type', 'add')
-            options = self._pending_disambiguation.get('options', [])
-            context = self._pending_disambiguation.get('context', {})
-        else:
-            # Legacy format: just a list of options (for /add)
-            dtype = 'add'
-            options = self._pending_disambiguation
-            context = {}
-        
-        if choice < 1 or choice > len(options):
-            self._send_text(f"Invalid choice. Please select a number between 1 and {len(options)}.", include_playlist=False)
-            return
-        
-        # Get the selected track
-        selected = options[choice - 1]
-        track_uri = selected[0]
-        
-        # Clear pending disambiguation
-        self._pending_disambiguation = None
-        
-        # Handle based on type
-        try:
-            if dtype == 'qa':
-                # Answer the question with the selected track
-                question_type = context.get('question_type', 'track_info')
-                answer = self._qa.answer_from_selection(question_type, selected)
-                self._send_text(answer, include_playlist=False)
-            else:
-                # Add the track (R3.1)
-                track = self._ps.add_by_uri(self._user_key, track_uri)
-                self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
-        except Exception as e:
-            self._send_text(f"Error: {str(e)}", include_playlist=False)
-    
-    def _handle_play(self, track_num: int = None) -> None:
-        """Handle /play command - get Spotify link for a track (R3.6)."""
-        pl = self._ps.current_playlist(self._user_key)
-        
-        if not pl.tracks:
-            self._send_text("Your playlist is empty. Add some tracks first!", include_playlist=False)
-            return
-        
-        # If no track number specified, show list with play options
-        if track_num is None:
-            html = f"<b>{pl.name}</b> tracks:<br/><ol>"
-            for i, track in enumerate(pl.tracks, 1):
-                html += f"<li>{track.artist} – {track.title}</li>"
-            html += "</ol>"
-            html += "Use <code>/play [number]</code> to get the Spotify link for a track."
-            self._send_text(html, include_playlist=False)
-            return
-        
-        # Validate track number
-        if track_num < 1 or track_num > len(pl.tracks):
-            self._send_text(f"Invalid track number. Please choose between 1 and {len(pl.tracks)}.", include_playlist=False)
-            return
-        
-        track = pl.tracks[track_num - 1]
-        
-        # Get Spotify details
-        try:
-            from .spotify_api import get_spotify_api
-            spotify = get_spotify_api()
-            if not spotify:
-                self._send_text("Spotify integration is not available.", include_playlist=False)
-                return
-            
-            details = spotify.get_track_details(track.artist, track.title)
-            if details and details['spotify_url']:
-                # Extract track ID from Spotify URL for embed
-                track_id = details['spotify_url'].split('/')[-1].split('?')[0]
-                
-                html = f"🎵 <b>{track.artist} – {track.title}</b><br/>"
-                html += f"<a href='{details['spotify_url']}' target='_blank'>▶️ Play on Spotify</a><br/>"
-                html += f"Popularity: {details['popularity']}/100 ⭐<br/>"
-                html += f"Duration: {details['duration_ms'] // 1000 // 60}:{(details['duration_ms'] // 1000) % 60:02d}<br/>"
-                
-                # Add Spotify iframe embed for playback (works without Web Playback SDK)
-                # Users can play 30-second previews or full tracks (with Spotify account)
-                html += f"<br/><iframe style='border-radius:12px' src='https://open.spotify.com/embed/track/{track_id}' "
-                html += f"width='100%' height='152' frameBorder='0' allowfullscreen='' "
-                html += f"allow='autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture' loading='lazy'></iframe>"
-                
-                self._send_text(html, include_playlist=False)
-            else:
-                self._send_text(f"Could not find <b>{track.artist} – {track.title}</b> on Spotify.", include_playlist=False)
-        except Exception as e:
-            self._send_text(f"Error getting Spotify info: {str(e)}", include_playlist=False)
-    
-    def _handle_preview_search(self, query: str) -> None:
-        """Handle /preview command - search and preview a track (R3.6)."""
-        try:
-            from .spotify_api import get_spotify_api
-            spotify = get_spotify_api()
-            if not spotify:
-                self._send_text("Spotify integration is not available.", include_playlist=False)
-                return
-            
-            # Parse query (simple: assume "artist - title" or just search as-is)
-            if ' - ' in query or ':' in query:
-                parts = query.replace(':', '-').split('-', 1)
-                artist = parts[0].strip()
-                title = parts[1].strip() if len(parts) > 1 else query
-            else:
-                # Search by title only (empty artist allows broader search)
-                artist = ""
-                title = query
-            
-            track_data = spotify.search_track(artist, title)
-            if track_data:
-                name = track_data['name']
-                artist_name = track_data['artists'][0]['name'] if track_data.get('artists') else "Unknown"
-                spotify_url = track_data.get('external_urls', {}).get('spotify')
-                popularity = track_data.get('popularity', 0)
-                duration_ms = track_data.get('duration_ms', 0)
-                track_id = track_data.get('id', '')
-                
-                html = f"🎵 <b>{artist_name} – {name}</b><br/>"
-                if spotify_url:
-                    html += f"<a href='{spotify_url}' target='_blank'>▶️ Play on Spotify</a><br/>"
-                html += f"Popularity: {popularity}/100 ⭐<br/>"
-                html += f"Duration: {duration_ms // 1000 // 60}:{(duration_ms // 1000) % 60:02d}<br/>"
-                
-                # Add Spotify iframe embed for playback
-                if track_id:
-                    html += f"<br/><iframe style='border-radius:12px' src='https://open.spotify.com/embed/track/{track_id}' "
-                    html += f"width='100%' height='152' frameBorder='0' allowfullscreen='' "
-                    html += f"allow='autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture' loading='lazy'></iframe>"
-                
-                self._send_text(html, include_playlist=False)
-            else:
-                self._send_text(f"Could not find '{query}' on Spotify.", include_playlist=False)
-        except Exception as e:
-            self._send_text(f"Error searching Spotify: {str(e)}", include_playlist=False)
-
-    def _format_stats(self, stats: dict) -> str:
-        """Format playlist statistics for display (R3.5)."""
-        html = f"<h3>📊 Statistics for <b>{stats['playlist_name']}</b></h3>"
-        html += "<ul>"
-        html += f"<li><b>Total tracks:</b> {stats['total_tracks']}</li>"
-        html += f"<li><b>Unique artists:</b> {stats['unique_artists']}</li>"
-        html += f"<li><b>Unique albums:</b> {stats['unique_albums']}</li>"
-        
-        # Spotify-enhanced statistics
-        if 'avg_popularity' in stats:
-            html += f"<li><b>Average popularity:</b> {stats['avg_popularity']}/100 ⭐</li>"
-        
-        if 'estimated_duration_minutes' in stats:
-            html += f"<li><b>Estimated duration:</b> ~{stats['estimated_duration_minutes']} minutes</li>"
-        
-        if stats.get('top_genres'):
-            html += "<li><b>Top genres:</b> "
-            genre_list = [f"<i>{genre}</i> ({count})" for genre, count in stats['top_genres']]
-            html += ", ".join(genre_list)
-            html += "</li>"
-        
-        if stats['top_artists']:
-            html += "<li><b>Top artists:</b><ol>"
-            for artist, count in stats['top_artists']:
-                plural = "track" if count == 1 else "tracks"
-                html += f"<li><b>{artist}</b> ({count} {plural})</li>"
-            html += "</ol></li>"
-        
-        html += "</ul>"
-        
-        if stats['total_tracks'] == 0:
-            html = f"<b>{stats['playlist_name']}</b> is empty. Add some tracks to see statistics!"
-        
-        return html
-
-    def _current_playlist_payload(self) -> dict:
-        state = self._ps.serialize_state(self._user_key)
-        curr = state["current"]
-        return state["playlists"][curr]
-
-    # ---------- message send utilities (template-compatible) ----------
-    def _send_text(self, text_html: str, *, include_playlist: bool = False, dialogue_acts: list[DialogueAct] | None = None) -> None:
-        """Send a message exactly how your template does (register with connector)."""
-        payload = self._current_playlist_payload() if include_playlist else None
-        text = text_html + _playlist_marker(payload)
+    def _send_text(
+        self,
+        text_html: str,
+        *,
+        include_playlist: bool = True,
+        dialogue_acts: Optional[list] = None
+    ) -> None:
+        playlist_obj = self._ps.serialize_current_playlist(self._user_key) if include_playlist else None
+        text = text_html + _playlist_marker_from_obj(playlist_obj)
         self._dialogue_connector.register_agent_utterance(
             AnnotatedUtterance(
                 text,
@@ -639,10 +307,203 @@ class MusicCRS(Agent):
         )
 
     def _send_playlist_text(self, text_html: str) -> None:
-        """Convenience: always include the current playlist marker."""
-        self._send_text(text_html, include_playlist=True)
+        acts = [DialogueAct(intent=_INTENT_INFORM)]
+        self._send_text(text_html, include_playlist=True, dialogue_acts=acts)
 
+    def _help_text(self) -> str:
+        return (
+            "I can manage playlists for you. Use these commands:<br/>"
+            "<ul>"
+            "<li><b>Adding songs</b><ul>"
+            "<li><code>/add [title]</code> — (use <code>/next</code>, <code>/previous</code>, <code>/page N</code> to browse)</li>"
+            "<li><code>/add [title] by [artist]</code></li>"
+            "<li><code>/add [artist] - [title]</code></li>"
+            "<li><code>/add [artist]: [title]</code></li>"
+            "</ul></li>"
+            "<li><b>Managing playlists</b><ul>"
+            "<li><code>/remove [index|uri]</code></li>"
+            "<li><code>/view</code>, <code>/clear</code>, <code>/create [name]</code>, <code>/switch [name]</code>, <code>/list</code></li>"
+            "</ul></li>"
+            "<li><b>Playback & info</b><ul>"
+            "<li><code>/play [number]</code> (Spotify embed if URI is a Spotify track)</li>"
+            "<li><code>/preview Artist/Title</code></li>"
+            "<li><code>/stats</code></li>"
+            "</ul></li>"
+            "<li><b>Questions & search</b><ul>"
+            "<li><code>/ask [question]</code> (DB-based)</li>"
+            "<li><code>/ask help</code> — show the supported question types</li>"
+            "</ul></li>"
+            "<li><b>Paging controls</b> — <code>/next</code>, <code>/previous</code>, <code>/page N</code></li>"
+            "</ul>"
+        )
 
+    # ---- disambiguation with paging ----
+    def _start_disambiguation(self, title: str, rows: List[Tuple[str, str, str, Optional[str]]]) -> None:
+        self._disambig = {"query": title, "rows": rows, "page": 0, "page_size": 10}
+        self._render_disambig_page()
+
+    def _paginate(self, delta: int, set_to: Optional[int] = None) -> None:
+        if not self._disambig:
+            self._send_text("No active selection. Use <code>/add &lt;title&gt;</code> first.", include_playlist=False)
+            return
+        total = len(self._disambig["rows"])
+        page_size = self._disambig["page_size"]
+        pages = max(1, (total + page_size - 1) // page_size)
+        newp = set_to if set_to is not None else self._disambig["page"] + delta
+        if newp < 0 or newp >= pages:
+            self._send_text("No more pages.", include_playlist=False)
+            return
+        self._disambig["page"] = newp
+        self._render_disambig_page()
+
+    def _render_disambig_page(self) -> None:
+        info = self._disambig
+        if not info:
+            return
+        rows = info["rows"]
+        page = info["page"]
+        page_size = info["page_size"]
+        query = info["query"]
+        total = len(rows)
+        start = page * page_size
+        end = min(start + page_size, total)
+
+        banner = (
+            f"I found <b>{total}</b> tracks with the title <b>{query}</b>. "
+            f"Showing <b>{start+1}–{end}</b> of <b>{total}</b>.<br/>"
+            f"Type the number to add that track (absolute, e.g. <code>12</code>), or <code>/next</code>, <code>/previous</code> "
+            f"(you can also <code>/page N</code>)."
+        )
+
+        html = banner + f"<br/><ol start='{start+1}'>"
+        for (uri, artist, title, album) in rows[start:end]:
+            pop = self._ps.get_popularity(uri)
+            album_label = album or "single"
+            html += f"<li><b>{artist}</b> – {title} (from <i>{album_label}</i> • {_format_pop_k(pop)})</li>"
+        html += "</ol>"
+
+        acts = [
+            DialogueAct(intent=Intent("INFORM"), annotations=[SlotValueAnnotation("option", "/previous")]),
+            DialogueAct(intent=Intent("INFORM"), annotations=[SlotValueAnnotation("option", "/next")]),
+        ]
+        self._send_text(html, include_playlist=False, dialogue_acts=acts)
+
+    def _handle_disambig_choice(self, choice: int) -> None:
+        info = self._disambig
+        if not info:
+            self._send_text("No pending selection.", include_playlist=False)
+            return
+        rows = info["rows"]
+        total = len(rows)
+        page = info["page"]
+        page_size = info["page_size"]
+        start = page * page_size
+        end = min(start + page_size, total)
+
+        if 1 <= choice <= total:
+            idx0 = choice - 1
+        elif 1 <= choice <= (end - start):
+            idx0 = start + (choice - 1)
+        else:
+            self._send_text("Invalid selection number.", include_playlist=False)
+            return
+
+        uri, artist, title, album = rows[idx0]
+        track = self._ps.add_by_uri(self._user_key, uri)
+        self._disambig = None
+        self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+
+    # ---- stats rendering ----
+    def _format_stats(self, stats: dict) -> str:
+        if not stats or stats.get("total_tracks", 0) == 0:
+            return "Your current playlist is empty. Add some tracks first!"
+        html = f"<h3>📊 Statistics for <b>{stats['playlist_name']}</b></h3>"
+        html += "<ul>"
+        html += f"<li><b>Total tracks:</b> {stats['total_tracks']}</li>"
+        html += f"<li><b>Unique artists:</b> {stats['unique_artists']}</li>"
+        html += f"<li><b>Unique albums:</b> {stats['unique_albums']}</li>"
+        html += f"<li><b>Average popularity (MPD):</b> {stats['avg_popularity_k']}</li>"
+        html += "</ul>"
+        if stats.get("top_artists"):
+            html += "<b>Top artists:</b><ol>"
+            for artist, count in stats["top_artists"]:
+                html += f"<li>{artist} <span style='opacity:.7'>(×{count})</span></li>"
+            html += "</ol>"
+        if stats.get("top_albums"):
+            html += "<b>Top albums:</b><ol>"
+            for album, count in stats["top_albums"]:
+                safe = album or "single"
+                html += f"<li><i>{safe}</i> <span style='opacity:.7'>(×{count})</span></li>"
+            html += "</ol>"
+        return html
+
+    # ---- playback helpers ----
+    def _handle_play(self, track_num: int | None) -> None:
+        pl = self._ps.current_playlist(self._user_key)
+        if not pl.tracks:
+            self._send_text("Your playlist is empty. Add some tracks first!", include_playlist=False)
+            return
+
+        if track_num is None:
+            html = f"<b>{pl.name}</b> tracks:<br/><ol>"
+            for i, track in enumerate(pl.tracks, 1):
+                html += f"<li>{track.artist} – {track.title}</li>"
+            html += "</ol>Use <code>/play [number]</code> to get the Spotify link for a track."
+            self._send_text(html, include_playlist=False)
+            return
+
+        if track_num < 1 or track_num > len(pl.tracks):
+            self._send_text(f"Invalid track number. Please choose between 1 and {len(pl.tracks)}.", include_playlist=False)
+            return
+
+        track = pl.tracks[track_num - 1]
+        if track.track_uri.startswith("spotify:track:"):
+            track_id = track.track_uri.split(":")[-1]
+            spotify_url = f"https://open.spotify.com/track/{track_id}"
+            html = f"🎵 <b>{track.artist} – {track.title}</b><br/>"
+            html += f"<a href='{spotify_url}' target='_blank'>▶️ Play on Spotify</a><br/>"
+            html += (
+                f"<br/><iframe style='border-radius:12px' "
+                f"src='https://open.spotify.com/embed/track/{track_id}' "
+                f"width='100%' height='152' frameBorder='0' allowfullscreen='' "
+                f"allow='autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture' "
+                f"loading='lazy'></iframe>"
+            )
+            self._send_text(html, include_playlist=False)
+        else:
+            self._send_text(f"I don't have a Spotify link for <b>{track.artist} – {track.title}</b>.", include_playlist=False)
+
+    def _handle_preview_search(self, query: str) -> None:
+        from .spotify_api import get_spotify_api
+        sp = get_spotify_api()
+        if not sp:
+            self._send_text("Preview lookup is disabled (Spotify credentials not set).", include_playlist=False)
+            return
+
+        artist, title = None, None
+        if "/" in query:
+            parts = [p.strip() for p in query.split("/", 1)]
+            if len(parts) == 2:
+                artist, title = parts
+        elif " - " in query or ":" in query:
+            parts = [p.strip() for p in query.replace(":", " - ").split(" - ", 1)]
+            if len(parts) == 2:
+                artist, title = parts
+        else:
+            title = query
+
+        if not title:
+            self._send_text("Use <code>/preview Artist/Title</code> or <code>/preview Artist - Title</code>.", include_playlist=False)
+            return
+
+        preview = sp.find_preview_url(artist or "", title)
+        if preview:
+            label = f"{artist} – {title}" if artist else title
+            self._send_text(f"<a href='{preview}' target='_blank'>Preview: {label}</a>", include_playlist=False)
+        else:
+            self._send_text("No preview found.", include_playlist=False)
+
+# runner
 if __name__ == "__main__":
     platform = FlaskSocketPlatform(MusicCRS)
     platform.start()

@@ -1,163 +1,209 @@
+"""Playlist cover generation with real Spotify covers and a 2x2 collage.
+
+Order of attempts:
+1) Spotify oEmbed (no auth) via track URI -> thumbnail_url
+2) Spotify Web API /v1/tracks (if credentials available)
+3) Web API search by artist/title (if credentials)
+4) Build a 2x2 collage (Pillow). If Pillow isn't installed or downloads fail,
+   fall back to returning the first image URL.
+5) Final fallback is a deterministic SVG.
+"""
+
 from __future__ import annotations
-import hashlib
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont
-import io
+
 import base64
+import io
+from hashlib import md5
+from typing import List, Optional
+from urllib.parse import quote
+
 import requests
-from typing import Optional
 
-# Still save a copy under project/static/covers for debugging,
-# but we RETURN a data URL so the frontend doesn't depend on Flask static.
-COVERS_DIR = (Path(__file__).resolve().parents[1] / "static" / "covers")
-COVERS_DIR.mkdir(parents=True, exist_ok=True)
-
-def _hash_colors(seed: str, n: int = 9) -> list[tuple[int, int, int]]:
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    colors = []
-    for i in range(n):
-        chunk = h[i * 6 : (i + 1) * 6]
-        if len(chunk) < 6:
-            chunk = (chunk + h)[:6]
-        r = int(chunk[0:2], 16)
-        g = int(chunk[2:4], 16)
-        b = int(chunk[4:6], 16)
-        colors.append((r, g, b))
-    return colors
+from .spotify_api import get_spotify_api
 
 
-def _fetch_album_image(url: str, size: int = 640) -> Optional[Image.Image]:
-    """Fetch and resize album artwork from Spotify."""
+# -------------------- helpers: fallback SVG -------------------- #
+def _inline_svg_cover(text: str) -> str:
+    """Create a simple deterministic SVG cover as a data URL."""
+    title = (text or "Playlist")
+    h = md5(title.encode("utf-8")).hexdigest()
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    bg = f"rgb({r},{g},{b})"
+    title_short = title[:22]
+    svg = f"""<svg xmlns='http://www.w3.org/2000/svg' width='512' height='512'>
+  <rect width='100%' height='100%' fill='{bg}'/>
+  <text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle'
+        font-family='Arial, Helvetica, sans-serif' font-size='36' fill='white'>{title_short}</text>
+</svg>"""
+    return f"data:image/svg+xml;utf8,{quote(svg)}"""
+
+
+# -------------------- helpers: Spotify lookups -------------------- #
+def _track_id_from_uri(uri: str) -> Optional[str]:
+    if not uri or not uri.startswith("spotify:track:"):
+        return None
+    parts = uri.split(":")
+    return parts[-1] if len(parts) >= 3 else None
+
+
+def _oembed_album_image(track_uri: str) -> Optional[str]:
+    """Tokenless: use Spotify oEmbed to get a thumbnail URL for a track."""
+    tid = _track_id_from_uri(track_uri)
+    if not tid:
+        return None
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        img = Image.open(io.BytesIO(response.content))
-        img = img.resize((size, size), Image.Resampling.LANCZOS)
-        return img
-    except Exception as e:
-        print(f"Error fetching album image: {e}")
+        # Works without auth; returns JSON with thumbnail_url
+        r = requests.get(
+            "https://open.spotify.com/oembed",
+            params={"url": f"spotify:track:{tid}"},
+            timeout=8,
+            headers={"User-Agent": "MusicCRS/cover-art"},
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        url = data.get("thumbnail_url")
+        return url
+    except Exception:
         return None
 
 
-def _create_spotify_style_cover(album_images: list[Image.Image], size: int = 640) -> Image.Image:
-    """
-    Create Spotify-style playlist cover based on number of album images.
-    - 1 image: full size
-    - 2 images: split vertically 50/50
-    - 3 images: top 50% one image, bottom 50% split horizontally
-    - 4+ images: 2x2 grid using first 4
-    """
-    canvas = Image.new("RGB", (size, size), (30, 30, 30))
-    
-    num_images = len(album_images)
-    
-    if num_images == 0:
-        return canvas
-    
-    elif num_images == 1:
-        # Single image fills entire cover
-        canvas.paste(album_images[0].resize((size, size), Image.Resampling.LANCZOS), (0, 0))
-    
-    elif num_images == 2:
-        # Two images split vertically
-        half = size // 2
-        canvas.paste(album_images[0].resize((half, size), Image.Resampling.LANCZOS), (0, 0))
-        canvas.paste(album_images[1].resize((half, size), Image.Resampling.LANCZOS), (half, 0))
-    
-    elif num_images == 3:
-        # Top: one image (50%)
-        # Bottom: two images (25% each)
-        half = size // 2
-        canvas.paste(album_images[0].resize((size, half), Image.Resampling.LANCZOS), (0, 0))
-        canvas.paste(album_images[1].resize((half, half), Image.Resampling.LANCZOS), (0, half))
-        canvas.paste(album_images[2].resize((half, half), Image.Resampling.LANCZOS), (half, half))
-    
-    else:  # 4 or more images
-        # 2x2 grid using first 4 images
-        half = size // 2
-        canvas.paste(album_images[0].resize((half, half), Image.Resampling.LANCZOS), (0, 0))
-        canvas.paste(album_images[1].resize((half, half), Image.Resampling.LANCZOS), (half, 0))
-        canvas.paste(album_images[2].resize((half, half), Image.Resampling.LANCZOS), (0, half))
-        canvas.paste(album_images[3].resize((half, half), Image.Resampling.LANCZOS), (half, half))
-    
-    return canvas
+def _album_image_from_track_api(track_uri: str) -> Optional[str]:
+    """If credentials are available, read album image from /v1/tracks/{id}."""
+    tid = _track_id_from_uri(track_uri)
+    if not tid:
+        return None
+    sp = get_spotify_api()
+    if not sp:
+        return None
+    details = sp.get_track_details(tid)  # tolerant signature
+    if not details:
+        return None
+    album = (details.get("album") or {})
+    images = (album.get("images") or [])
+    return images[0]["url"] if images else None
 
 
-def _create_fallback_cover(playlist, size: int = 640) -> Image.Image:
-    """Create a fallback mosaic cover when album images aren't available."""
-    seed = playlist.name + "|" + "|".join([t.artist + ":" + t.title for t in playlist.tracks[:8]])
-    colors = _hash_colors(seed, 9)
-
-    tile = size // 3
-    img = Image.new("RGB", (size, size), (30, 30, 30))
-    draw = ImageDraw.Draw(img)
-
-    # 3x3 mosaic
-    idx = 0
-    for y in range(3):
-        for x in range(3):
-            draw.rectangle((x * tile, y * tile, (x + 1) * tile, (y + 1) * tile), fill=colors[idx % len(colors)])
-            idx += 1
-    
-    return img
+def _search_album_image(artist: Optional[str], title: Optional[str]) -> Optional[str]:
+    """Fallback: search by (artist, title) and return the largest album image URL."""
+    if not title:
+        return None
+    sp = get_spotify_api()
+    if not sp:
+        return None
+    return sp.find_cover_image(artist or "", title)
 
 
-def generate_cover(user_id: str, playlist) -> str:
-    """
-    Create a Spotify-style playlist cover using album artwork.
-    Falls back to color mosaic if Spotify images unavailable.
-    Returns a data URL.
-    """
-    size = 640
-    
-    # Try to get album images from Spotify for first 4 tracks
-    from .spotify_api import get_spotify_api
-    
-    album_images = []
-    spotify = get_spotify_api()
-    
-    if spotify and len(playlist.tracks) > 0:
-        # Get album artwork for first 4 unique tracks
-        seen_albums = set()
-        for track in playlist.tracks[:8]:  # Check up to 8 tracks to get 4 unique albums
-            if len(album_images) >= 4:
-                break
-            
-            details = spotify.get_track_details(track.artist, track.title)
-            if details and details.get("album_image"):
-                album_url = details["album_image"]
-                # Avoid duplicate albums
-                if album_url not in seen_albums:
-                    seen_albums.add(album_url)
-                    img = _fetch_album_image(album_url, size)
-                    if img:
-                        album_images.append(img)
-    
-    # Create cover based on available images
-    if album_images:
-        img = _create_spotify_style_cover(album_images, size)
-    else:
-        # Fallback to color mosaic
-        img = _create_fallback_cover(playlist, size)
-    
-    # No text overlay - the album artwork grid is the cover
-    # This satisfies R2.6 as the cover is based on playlist songs
-
-    # Convert to RGB for saving
-    img = img.convert("RGB")
-
-    # Save a file copy (optional debug)
-    safe_user = "".join(c for c in (user_id or "user") if c.isalnum() or c in ("-", "_")).strip("_")
-    safe_name = "".join(c for c in (playlist.name or "default") if c.isalnum() or c in ("-", "_")).strip("_")
-    out_path = COVERS_DIR / f"{safe_user}__{safe_name}.png"
+# -------------------- helpers: HTTP + collage -------------------- #
+def _download_image(url: str):
+    """Download an image and return a Pillow Image, or None on failure."""
     try:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out_path, format="PNG")
+        r = requests.get(url, headers={"User-Agent": "MusicCRS/cover-art"}, timeout=10)
+        if r.status_code != 200 or not r.content:
+            return None
+        from PIL import Image  # lazy import
+        img = Image.open(io.BytesIO(r.content))
+        return img.convert("RGB")
     except Exception:
-        pass  # saving is best-effort
+        return None
 
-    # Return as data URL so the frontend can display without hitting Flask static
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
+
+def _make_collage(urls: List[str], size: int = 512) -> Optional[str]:
+    """Compose a 2x2 collage from up to 4 image URLs and return as data URL (JPEG).
+    If Pillow isn't installed or all downloads fail, return None.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return None
+
+    if not urls:
+        return None
+
+    # Download up to 4 images
+    imgs = []
+    for u in urls[:4]:
+        img = _download_image(u)
+        if img:
+            imgs.append(img)
+    if not imgs:
+        return None
+
+    N = len(imgs)
+    tile = size // 2
+    canvas = Image.new("RGB", (size, size), (30, 30, 30))
+
+    def fit(img):
+        return img.resize((tile, tile), Image.LANCZOS)
+
+    if N == 1:
+        im = imgs[0].resize((size, size), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90, optimize=True)
+    elif N == 2:
+        canvas.paste(fit(imgs[0]), (0, 0))
+        canvas.paste(fit(imgs[1]), (tile, 0))
+        canvas.paste(fit(imgs[0]), (0, tile))
+        canvas.paste(fit(imgs[1]), (tile, tile))
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=90, optimize=True)
+    elif N == 3:
+        canvas.paste(fit(imgs[0]), (0, 0))
+        canvas.paste(fit(imgs[1]), (tile, 0))
+        canvas.paste(fit(imgs[2]), (0, tile))
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=90, optimize=True)
+    else:
+        canvas.paste(fit(imgs[0]), (0, 0))
+        canvas.paste(fit(imgs[1]), (tile, 0))
+        canvas.paste(fit(imgs[2]), (0, tile))
+        canvas.paste(fit(imgs[3]), (tile, tile))
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=90, optimize=True)
+
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+    return f"data:image/jpeg;base64,{b64}"
+
+
+# -------------------- main API -------------------- #
+def generate_cover(user_id: str, playlist) -> str:
+    """Return a URL (or data: URL) for the playlist cover. Never raises.
+
+    * Uses the first up to 4 tracks of the playlist.
+    * Returns a real album cover as soon as you add the first song.
+    * Collage (2x2) used when multiple covers are available (requires Pillow).
+    """
+    name = getattr(playlist, "name", "") or "Playlist"
+    tracks = getattr(playlist, "tracks", None) or []
+
+    urls: List[str] = []
+    seen = set()
+
+    # Collect up to 4 covers for the first 4 tracks
+    for t in tracks[:4]:
+        uri = getattr(t, "track_uri", "") or getattr(t, "uri", "")
+        artist = getattr(t, "artist", None)
+        title = getattr(t, "title", None)
+
+        # 1) Tokenless oEmbed
+        for u in (
+            _oembed_album_image(uri),
+            _album_image_from_track_api(uri),   # 2) Web API (auth)
+            _search_album_image(artist, title), # 3) Search (auth)
+        ):
+            if u and u not in seen:
+                urls.append(u)
+                seen.add(u)
+                break
+
+    # Try to build a collage; if that fails but we have URLs, return the first URL
+    collage = _make_collage(urls, size=512)
+    if collage:
+        return collage
+    if urls:
+        return urls[0]
+
+    # Final fallback
+    return _inline_svg_cover(name)
