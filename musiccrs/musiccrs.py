@@ -7,6 +7,7 @@ Adds: /ask help — lists all supported question types for /ask.
 from __future__ import annotations
 import json, os, re
 from typing import Optional, List, Tuple
+from musiccrs.recommender import recommend_by_cooccurrence
 
 try:
     import ollama
@@ -79,6 +80,8 @@ class MusicCRS(Agent):
         self._cmd_stats     = re.compile(r"^/stats$", re.IGNORECASE)
         self._cmd_play      = re.compile(r"^/play(?:\s+(\d+))?$", re.IGNORECASE)
         self._cmd_preview   = re.compile(r"^/preview\s+(.+)$", re.IGNORECASE)
+        self._cmd_recommend = re.compile(r"^/recommend(?:\s+(\d+))?$", re.IGNORECASE)
+
 
         # paging
         self._cmd_next      = re.compile(r"^/(?:next|more)$", re.IGNORECASE)
@@ -157,6 +160,14 @@ class MusicCRS(Agent):
                 q = m.group(1).strip()
                 ans = self._qa.answer_question(q)
                 self._send_text(ans, include_playlist=False)
+                return
+            
+            if m := self._cmd_recommend.match(text or ""):
+                k = int(m.group(1) or 5)
+                try:
+                    self._handle_recommend(limit=k)
+                except Exception as e:
+                    self._send_text(f"Sorry — recommendation failed: {e}")
                 return
 
             # playlist ops
@@ -502,6 +513,45 @@ class MusicCRS(Agent):
             self._send_text(f"<a href='{preview}' target='_blank'>Preview: {label}</a>", include_playlist=False)
         else:
             self._send_text("No preview found.", include_playlist=False)
+    def _handle_recommend(self, *, limit: int = 5) -> None:
+        """
+        Recommend 3–5 tracks related to the current playlist using existing user playlists in the DB.
+        """
+        # Pull user’s current playlist from your existing service
+        pl = self._ps.current_playlist(self._user_key)  # assumes your PlaylistService
+        seed_uris = [t.track_uri for t in getattr(pl, "tracks", []) if getattr(t, "track_uri", None)]
+
+        if not seed_uris:
+            self._send_text(
+                "Your playlist is empty. Add a few songs first with <code>/add Artist : Title</code>."
+            )
+            return
+
+        # Clamp to 3–5 as required
+        limit = max(3, min(5, int(limit or 5)))
+
+        recs = recommend_by_cooccurrence(seed_uris, limit=limit)
+
+        if not recs:
+            self._send_text("I couldn't find related songs from similar user playlists.")
+            return
+
+        # Render suggestions + copyable /add lines for fast UX
+        lines = []
+        for i, r in enumerate(recs, start=1):
+            album = r.get("album") or "single"
+            reason = r.get("reason") or ""
+            lines.append(
+                f"{i}. {r['artist']} – {r['title']} <span class='text-muted'>({album})</span>"
+                f"<br/><code>/add {r['artist']} : {r['title']}</code>"
+                f"<br/><span class='text-muted small'>{reason} • score {r['score']:.3f}</span>"
+            )
+
+        self._send_text(
+            "Here are some related picks based on similar user playlists:<br/>"
+            + "<br/><br/>".join(lines),
+            include_playlist=False,
+        )
 
 # runner
 if __name__ == "__main__":

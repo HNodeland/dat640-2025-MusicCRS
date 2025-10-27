@@ -224,13 +224,12 @@ class QASystem:
             "<code>what album is &lt;title&gt; by &lt;artist&gt; [on]</code><br/>"
             "<code>which album does &lt;title&gt; by &lt;artist&gt; appear on</code></li>"
             "<li><b>Count songs by an artist</b><br/>"
-            "<code>how many songs by &lt;artist&gt;</code> (also accepts <code>tracks</code>)</li>"
+            "<code>how many songs by &lt;artist&gt;</code></li>"
             "<li><b>List albums by an artist</b><br/>"
             "<code>what albums does &lt;artist&gt; have</code><br/>"
             "<code>list albums by &lt;artist&gt;</code> / <code>show albums by &lt;artist&gt;</code></li>"
             "<li><b>Similar artists</b><br/>"
             "<code>who sounds like &lt;artist&gt;</code> / <code>who is similar to &lt;artist&gt;</code><br/>"
-            "<i>Note:</i> Uses playlist co-occurrence if available in your DB build.</li>"
             "<li><b>Availability check</b><br/>"
             "<code>do you have &lt;title&gt; by &lt;artist&gt;</code></li>"
             "<li><b>Fallback title suggestions</b><br/>"
@@ -280,7 +279,7 @@ class QASystem:
                 return "Similar-artist lookup isn't available in this database build."
             if not sims:
                 return f"I couldn't find artists similar to {artist}."
-            items = [f"{a} (co-occur {c}×)" for a, c in sims]
+            items = [f"{a} (co-occur {c} times)" for a, c in sims]
             return "Artists often played with that artist:<br/>" + "<br/>".join(items)
 
         # Availability
