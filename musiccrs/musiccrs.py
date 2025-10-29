@@ -8,6 +8,7 @@ from __future__ import annotations
 import json, os, re
 from typing import Optional, List, Tuple
 from musiccrs.recommender import recommend_by_cooccurrence
+from collections import defaultdict, Counter
 
 try:
     import ollama
@@ -33,6 +34,7 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
 _INTENT_OPTIONS = Intent("OPTIONS")
 _INTENT_INFORM = Intent("INFORM")
+
 
 def _playlist_marker_from_obj(playlist_obj: dict | None) -> str:
     if not playlist_obj:
@@ -127,6 +129,13 @@ class MusicCRS(Agent):
                 payload = text[len("/bulkadd"):].strip()
                 self._handle_bulkadd(payload)
                 return
+            
+            if text.strip().lower().startswith("/auto"):
+                query = text[len("/auto"):].strip()
+                self._handle_auto(query)
+                return
+
+
 
             
             # paging
@@ -766,6 +775,185 @@ class MusicCRS(Agent):
         )
 
         self._send_text(html, include_playlist=False)
+        
+
+
+    def _search_mpd_playlists(self, query: str, limit: int = 12):
+        """
+        Search playlist titles via the small index in ./data/mpd_titles_fts.sqlite.
+        Returns: [{'id': pid, 'name': str, 'ntracks': int|None}, ...]
+        """
+        from . import title_index
+        # not building here; assume you've run tools/build_title_index.py already
+        return title_index.search_titles(query, limit=limit)
+
+
+    def _get_mpd_playlist_tracks(self, playlist_id: int):
+        """
+        Fast track fetch by playlist id from ./data/mpd.sqlite.
+        Schema expected from tools/build_mpd_sqlite.py:
+        - playlists(pid PRIMARY KEY, name, num_tracks, ...)
+        - tracks(track_uri PRIMARY KEY, artist, title, album, ...)
+        - playlist_tracks(pid, track_uri)
+        Returns list of (uri, artist, title).
+        """
+        import sqlite3, os
+        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "mpd.sqlite")
+        db_path = os.path.abspath(db_path)
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            cur = con.execute(
+                """
+                SELECT pt.track_uri AS uri,
+                    t.artist     AS artist,
+                    t.title      AS title
+                FROM playlist_tracks AS pt
+                JOIN tracks AS t ON t.track_uri = pt.track_uri
+                WHERE pt.pid = ?
+                """,
+                (int(playlist_id),),
+            )
+            out = []
+            for r in cur.fetchall():
+                uri = r["uri"]; artist = r["artist"]; title = r["title"]
+                if uri and artist and title:
+                    out.append((uri, artist, title))
+            return out
+        finally:
+            con.close()
+
+
+    def _handle_auto(self, query: str) -> None:
+        """
+        /auto <natural language>
+        - Title-only search (BM25/LIKE) over playlist names via ./data/mpd_titles_fts.sqlite
+        - Aggregate tracks from those matched playlist IDs via ./data/mpd.sqlite
+        - Rank by frequency (decaying weight by rank), enforce <=2 tracks per artist
+        """
+        from html import escape as _e
+        from collections import defaultdict
+        import re
+
+        q = (query or "").strip()
+        if not q:
+            self._send_text("Usage: <code>/auto your vibe here</code>")
+            return
+
+        matched = self._search_mpd_playlists(q, limit=12)
+        if not matched:
+            self._send_text(f"I couldn't find any playlists for: <b>{_e(q)}</b>.")
+            return
+
+        # keep only entries with an id
+        mpd_with_id = [m for m in matched if m.get("id") is not None]
+        if not mpd_with_id:
+            self._send_text(f"I couldn't resolve matching playlists for: <b>{_e(q)}</b>.")
+            return
+
+        mpd_names = [m["name"] for m in mpd_with_id if m.get("name")]
+
+        # target length: median num_tracks when available; else based on wordiness
+        sizes = [m.get("ntracks") for m in mpd_with_id if isinstance(m.get("ntracks"), int)]
+        sizes = [s for s in sizes if 5 <= s <= 200]
+        if sizes:
+            sizes.sort()
+            target_len = max(18, min(50, sizes[len(sizes)//2]))
+        else:
+            words = [w for w in re.findall(r"[A-Za-z0-9']+", q)]
+            target_len = max(20, min(40, 22 + max(0, len(words) - 2)))
+
+        # derive a name from the matched titles (no hard-coded vocab)
+        def _auto_name_from_titles(qtext: str, names: list[str]) -> str:
+            import re
+            from collections import Counter
+            toks = []
+            stop = {"a","an","the","and","or","for","of","to","in","on","at","by","with",
+                    "my","your","our","playlist","mix","music","songs","hits"}
+            for nm in names[:15]:
+                toks += [w.lower() for w in re.findall(r"[A-Za-z0-9']+", nm)]
+            kept = [w for w in toks if w not in stop and len(w) >= 3]
+            if kept:
+                common = [w for w,_ in Counter(kept).most_common(4)]
+                title = " ".join(w.capitalize() for w in common[:3]).strip()
+                if title:
+                    return title if any(k in title.lower() for k in ("vibes","mood","energy","focus","party","chill")) else f"{title} Vibes"
+            qtoks = [w for w in re.findall(r"[A-Za-z0-9']+", qtext)]
+            return (" ".join(qtoks[:3]).title()) if qtoks else "Personal Mix"
+
+        name = _auto_name_from_titles(q, mpd_names)
+
+        # aggregate tracks with decaying weight by rank
+        uri_score = defaultdict(float)
+        uri_meta  = {}
+        for rank, pl in enumerate(mpd_with_id, start=1):
+            w = max(0.40, 1.0 - 0.07*(rank-1))  # 1.00, 0.93, 0.86, ...
+            tracks = self._get_mpd_playlist_tracks(pl["id"])
+            for uri, artist, title in tracks:
+                if not uri or not artist or not title:
+                    continue
+                uri_score[uri] += w
+                if uri not in uri_meta:
+                    uri_meta[uri] = (artist, title)
+
+        if not uri_score:
+            self._send_text(f"I couldn't assemble a playlist from: <b>{_e(q)}</b>.")
+            return
+
+        ranked = sorted(uri_score.items(), key=lambda kv: kv[1], reverse=True)
+
+        # create & switch to new playlist using your existing playlist_service
+        created_ok = False
+        for create_call in (
+            lambda: getattr(self._ps, "new_playlist")(self._user_key, name),
+            lambda: getattr(self._ps, "create_playlist")(self._user_key, name),
+            lambda: getattr(self._ps, "new")(self._user_key, name),
+        ):
+            try:
+                create_call()
+                created_ok = True
+                break
+            except Exception:
+                continue
+        if not created_ok:
+            self._send_text("Sorry, I couldn't create a new playlist in this environment.")
+            return
+
+        # add with artist diversity (≤2 per artist)
+        add_by_uri = self._ps.add_by_uri
+        artist_counts = {}
+        added = 0
+
+        def artist_ok(a: str) -> bool:
+            return artist_counts.get(a, 0) < 2
+
+        for uri, _s in ranked:
+            a, t = uri_meta.get(uri, ("", ""))
+            if not a or not t or not artist_ok(a):
+                continue
+            try:
+                add_by_uri(self._user_key, uri)
+                artist_counts[a] = artist_counts.get(a, 0) + 1
+                added += 1
+            except Exception:
+                continue
+            if added >= target_len:
+                break
+
+        if added == 0:
+            self._send_text(f"I couldn't assemble a playlist from: <b>{_e(q)}</b>.")
+            return
+
+        blurb = ""
+        if mpd_names:
+            show = ", ".join(_e(n) for n in mpd_names[:3])
+            blurb = f"<br/><span class='text-muted'>Inspired by MPD playlists like: {show}</span>"
+
+        self._send_playlist_text(
+            f"Created <b>{_e(name)}</b> — {added} songs, from playlists matching “{_e(q)}”.{blurb}"
+        )
+
+
 
     
 # runner
