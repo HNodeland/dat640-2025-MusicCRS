@@ -123,6 +123,12 @@ class MusicCRS(Agent):
                 self.goodbye()
                 return
 
+            if text.strip().lower().startswith("/bulkadd"):
+                payload = text[len("/bulkadd"):].strip()
+                self._handle_bulkadd(payload)
+                return
+
+            
             # paging
             if self._cmd_next.match(text):
                 self._paginate(+1)
@@ -513,12 +519,187 @@ class MusicCRS(Agent):
             self._send_text(f"<a href='{preview}' target='_blank'>Preview: {label}</a>", include_playlist=False)
         else:
             self._send_text("No preview found.", include_playlist=False)
-    def _handle_recommend(self, *, limit: int = 5) -> None:
+
+    def _handle_bulkadd(self, payload: str) -> None:
         """
-        Recommend 3–5 tracks related to the current playlist using existing user playlists in the DB.
+        Add multiple tracks in one go. Payload is a newline- or '||'-separated list
+        of 'Artist : Title' entries (no quotes).
         """
-        # Pull user’s current playlist from your existing service
-        pl = self._ps.current_playlist(self._user_key)  # assumes your PlaylistService
+        from html import escape as _e
+        import re
+
+        payload = (payload or "").strip()
+        if not payload:
+            self._send_text("Nothing selected to add.")
+            return
+
+        # Split on newlines OR '||'
+        parts = [p.strip() for p in re.split(r"(?:\n|\|\|)", payload) if p.strip()]
+        added = []
+        errors = []
+
+        for p in parts:
+            if ":" not in p:
+                errors.append(p)
+                continue
+            artist, title = p.split(":", 1)
+            artist = artist.strip()
+            title = title.strip()
+            if not artist or not title:
+                errors.append(p)
+                continue
+            try:
+                track = self._ps.add_track_by_artist_title(self._user_key, artist, title)
+                added.append(f"{_e(track.artist)} – {_e(track.title)}")
+            except Exception:
+                errors.append(p)
+
+        if added:
+            self._send_playlist_text("Added: " + ", ".join(f"<b>{s}</b>" for s in added))
+        if errors:
+            self._send_text("Couldn't add: " + ", ".join(_e(e) for e in errors))
+
+
+    def _handle_recommend(self, *, limit: int = 3) -> None:
+        """
+        Recommend tracks related to the current playlist and render them
+        with:
+        - checkboxes + green "Add to playlist" button (unchanged)
+        - a friendly one-liner reason (humanized)
+        - an expandable detailed explanation that describes how/why it was chosen
+        """
+        from html import escape as _e
+        import re as _re
+
+        # ---------- helpers (local-only) ----------
+        def _parse_stats(raw_reason: str, rec: dict):
+            """Extract co-occurrence strength and playlist-count from either the reason text or fields in `rec`."""
+            raw = raw_reason or ""
+
+            # try parsing numbers out of the existing reason string
+            m_co = _re.search(r'(?:co[- ]?occurrence|cooccurrence)\s+(\d+)', raw, _re.I)
+            m_pl = (_re.search(r'(\d+)\s+(?:highly-)?matching\s+playlists', raw, _re.I)
+                    or _re.search(r'across\s+(\d+)\s+.*playlists', raw, _re.I))
+
+            co_val = None
+            pl_val = None
+
+            try:
+                if m_co:
+                    co_val = int(m_co.group(1))
+            except Exception:
+                pass
+            try:
+                if m_pl:
+                    pl_val = int(m_pl.group(1))
+            except Exception:
+                pass
+
+            # fallbacks from structured fields (if present)
+            if co_val is None:
+                for k in ("cooccurrence", "co_occurrence", "overlap_score", "score"):
+                    if k in rec and rec[k] is not None:
+                        try:
+                            co_val = int(rec[k]) if float(rec[k]).is_integer() else float(rec[k])
+                        except Exception:
+                            pass
+                        break
+            if pl_val is None:
+                for k in ("playlist_count", "lists", "playlist_hits", "num_playlists"):
+                    if k in rec and rec[k] is not None:
+                        try:
+                            pl_val = int(rec[k])
+                        except Exception:
+                            pass
+                        break
+
+            # qualitative label from strength
+            strength = None
+            try:
+                if co_val is not None:
+                    v = float(co_val)
+                    if v >= 2000:
+                        strength = "very strong"
+                    elif v >= 1000:
+                        strength = "strong"
+                    elif v >= 400:
+                        strength = "good"
+                    else:
+                        strength = "light"
+            except Exception:
+                pass
+
+            return co_val, pl_val, strength
+
+        def _friendly_reason(raw_reason: str, rec: dict) -> str:
+            """Short, human explanation."""
+            co_val, pl_val, strength = _parse_stats(raw_reason, rec)
+            if pl_val and strength:
+                return f"Often added together in {pl_val} playlists like yours ({strength} match)."
+            if pl_val:
+                return f"Often added together in {pl_val} playlists like yours."
+            if strength:
+                return f"Often added together with your songs ({strength} match)."
+            return raw_reason or "Often added together by listeners with similar taste."
+
+        def _collect_overlap_seeds(rec: dict):
+            """
+            Pull a few seed tracks/artists this rec overlaps with, if your recommender
+            exposed any such fields. We check several common keys and gracefully
+            fall back if none exist.
+            """
+            candidates = []
+            for k in (
+                "matched_seeds",
+                "seed_matches",
+                "overlap_seeds",
+                "seed_titles",
+                "overlap_tracks",
+                "seed_examples",
+            ):
+                v = rec.get(k)
+                if isinstance(v, (list, tuple)):
+                    candidates = [str(x) for x in v if str(x).strip()]
+                    if candidates:
+                        break
+            # Keep it tidy
+            return candidates[:5]
+
+        def _detailed_reason(raw_reason: str, rec: dict) -> str:
+            """
+            More explicit explanation for curious users.
+            Returns small HTML (no nested f-string quotes).
+            """
+            co_val, pl_val, strength = _parse_stats(raw_reason, rec)
+            seeds = _collect_overlap_seeds(rec)
+            lines = []
+
+            if pl_val:
+                lines.append(f"Found in {_e(str(pl_val))} community playlists similar to yours.")
+            if co_val is not None:
+                lines.append(f"Frequently appears alongside your picks (co-occurrence score {_e(str(co_val))}).")
+            if strength:
+                lines.append(f"Overall match strength: {_e(strength.capitalize())}.")
+
+            if seeds:
+                # Try to format seeds nicely; if items look like 'Artist – Title' already, use as-is.
+                seed_html = ", ".join(_e(s) for s in seeds)
+                lines.append(f"Notable overlaps with your current songs: {seed_html}.")
+
+            # If the raw technical reason exists, include it as a footnote for transparency
+            if raw_reason and raw_reason.strip():
+                lines.append(f"<span class='text-muted'>Data note: {_e(raw_reason)}</span>")
+
+            if not lines:
+                return "Recommended because people with playlists like yours often add this song."
+
+            # Build a compact list
+            li_html = "".join(f"<li>{ln}</li>" for ln in lines)
+            return f"<ul class='mb-0'>{li_html}</ul>"
+
+        # ---------- main body ----------
+        # Pull user's current playlist
+        pl = self._ps.current_playlist(self._user_key)
         seed_uris = [t.track_uri for t in getattr(pl, "tracks", []) if getattr(t, "track_uri", None)]
 
         if not seed_uris:
@@ -527,32 +708,66 @@ class MusicCRS(Agent):
             )
             return
 
-        # Clamp to 3–5 as required
-        limit = max(3, min(5, int(limit or 5)))
-
-        recs = recommend_by_cooccurrence(seed_uris, limit=limit)
-
+        # Get recommendations
+        recs = recommend_by_cooccurrence(seed_uris, limit=max(3, limit))
         if not recs:
-            self._send_text("I couldn't find related songs from similar user playlists.")
+            self._send_text("I couldn't find related tracks right now.")
             return
 
-        # Render suggestions + copyable /add lines for fast UX
-        lines = []
-        for i, r in enumerate(recs, start=1):
-            album = r.get("album") or "single"
-            reason = r.get("reason") or ""
-            lines.append(
-                f"{i}. {r['artist']} – {r['title']} <span class='text-muted'>({album})</span>"
-                f"<br/><code>/add {r['artist']} : {r['title']}</code>"
-                f"<br/><span class='text-muted small'>{reason} • score {r['score']:.3f}</span>"
+        items_html_list = []
+        for i, r in enumerate(recs[:limit], start=1):
+            artist = r.get("artist", "") or ""
+            title = r.get("title", "") or ""
+            album = r.get("album") or ""
+            raw_reason = r.get("reason") or ""
+
+            friendly = _friendly_reason(raw_reason, r)
+            detailed_html = _detailed_reason(raw_reason, r)
+
+            album_html = f' <span class="text-muted">({_e(album)})</span>' if album else ""
+            reason_html = f'<div class="small text-muted">{_e(friendly)}</div>' if friendly else ""
+
+            # Use native <details> so we don't need any frontend JS changes.
+            details_block = (
+                "<details class='mt-1'>"
+                "<summary class='small text-muted' style='cursor:pointer;'>Why this is recommended</summary>"
+                f"<div class='small mt-1'>{detailed_html}</div>"
+                "</details>"
             )
 
-        self._send_text(
-            "Here are some related picks based on similar user playlists:<br/>"
-            + "<br/><br/>".join(lines),
-            include_playlist=False,
+            item_html = (
+                f"<li class='mb-3'>"
+                f"  <div class='form-check'>"
+                f"    <input class='form-check-input reco-item' type='checkbox' id='reco-{i}' "
+                f"           data-artist='{_e(artist)}' data-title='{_e(title)}' />"
+                f"    <label class='form-check-label' for='reco-{i}'>"
+                f"      {i}. {_e(artist)} – {_e(title)}{album_html}"
+                f"    </label>"
+                f"  </div>"
+                f"  {reason_html}"
+                f"  {details_block}"
+                f"</li>"
+            )
+            items_html_list.append(item_html)
+
+        # Inline styles so this works regardless of your CSS stack
+        html = (
+            "<div class='recommend-block'>"
+            "<p>Here are some related picks:</p>"
+            "<ul class='list-unstyled' style='margin:0;padding-left:0'>"
+            f"{''.join(items_html_list)}"
+            "</ul>"
+            "<button type='button' data-action='bulk-add-selected' "
+            "        style='margin-top:10px;padding:8px 12px;border:0;border-radius:8px;"
+            "               background:#16a34a;color:#fff;font-weight:600;'>"
+            "  Add to playlist"
+            "</button>"
+            "</div>"
         )
 
+        self._send_text(html, include_playlist=False)
+
+    
 # runner
 if __name__ == "__main__":
     platform = FlaskSocketPlatform(MusicCRS)

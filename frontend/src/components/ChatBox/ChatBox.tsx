@@ -21,6 +21,8 @@ import {
 import { AgentChatMessage, UserChatMessage } from "../ChatMessage";
 import { ChatMessage } from "../../types";
 import { ConfigContext } from "../../contexts/ConfigContext";
+import RecommendButton from "./RecommendButton";
+
 
 function extractMessageText(message: any): string {
   // Be liberal in what we accept: text could be at different paths depending on server/lib versions
@@ -48,6 +50,8 @@ function extractFirstImageUrl(message: any): string | undefined {
 
   return img1 || img2 || img3 || undefined;
 }
+
+
 
 export default function ChatBox() {
   const { config } = useContext(ConfigContext);
@@ -105,6 +109,41 @@ export default function ChatBox() {
       quickReply({ message });
     },
     [chatMessagesRef, quickReply]
+  );
+
+  const handleMessageAreaClick = React.useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement;
+      const addBtn = target.closest('[data-action="bulk-add-selected"]') as HTMLElement | null;
+      if (!addBtn) return;
+
+      const container = addBtn.closest(".recommend-block") as HTMLElement | null;
+      if (!container) return;
+
+      // Collect checked items and format "Artist : Title"
+      const inputs = Array.from(
+        container.querySelectorAll('input[type="checkbox"][data-artist][data-title]')
+      ) as HTMLInputElement[];
+
+      const lines = inputs
+        .filter((i) => i.checked)
+        .map((i) => {
+          const artist = (i.getAttribute("data-artist") || "").trim();
+          const title = (i.getAttribute("data-title") || "").trim();
+          return artist && title ? `${artist} : ${title}` : "";
+        })
+        .filter(Boolean);
+
+      if (lines.length === 0) return;
+
+      // Send ONE message that contains all items; the backend /bulkadd splits it.
+      const payload = `/bulkadd ${lines.join("\n")}`;
+      handleQuickReply(payload);
+
+      e.preventDefault();
+      e.stopPropagation();
+    },
+    [handleQuickReply]
   );
 
   const handelMessage = useCallback(
@@ -220,7 +259,7 @@ export default function ChatBox() {
         </MDBCardHeader>
 
         <MDBCardBody>
-          <div className="card-body-messages">
+          <div className="card-body-messages" onClick={handleMessageAreaClick}>
             {chatMessages}
             <div className="d-flex flex-wrap justify-content-between">
               {chatButtons}
@@ -237,6 +276,8 @@ export default function ChatBox() {
               placeholder="Type message"
               ref={inputRef}
             ></input>
+            <RecommendButton onClick={() => handleQuickReply("/recommend 3")} />
+
             <button type="submit" className="btn btn-link text-muted">
               <MDBIcon fas size="2x" icon="paper-plane" />
             </button>
