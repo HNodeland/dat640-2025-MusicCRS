@@ -526,7 +526,7 @@ class MusicCRS(Agent):
         # Use the existing /ask functionality
         query = intent.raw_text
         try:
-            result = self._qa.answer_question(query)
+            result = self._qa.query(self._user_key, query, self._ps)
             if result:
                 self._send_text(result, include_playlist=False)
             else:
