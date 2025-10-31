@@ -137,12 +137,28 @@ export default function PlaylistPanel() {
         <details>
           <summary className="fw-bold" style={{ cursor: "pointer" }}>How to use</summary>
           <div className="mt-2">
-            <h6>Adding Songs</h6>
+            <h6>🎵 Natural Language (NEW!)</h6>
+            <ul className="small">
+              <li><strong>Add songs:</strong> "add one dance by drake", "play humble"</li>
+              <li><strong>View playlist:</strong> "show my playlist", "what's in my playlist"</li>
+              <li><strong>Remove songs:</strong> "remove track 3", "delete humble"</li>
+              <li><strong>Get recommendations:</strong> "recommend 5 songs", "suggest similar music"</li>
+              <li><strong>Select from recommendations:</strong> "add first two", "add all except drake"</li>
+              <li><strong>Ask questions:</strong> "what artists are in my playlist", "how many songs by beatles"</li>
+            </ul>
+            
+            <h6>Adding Songs (Structured)</h6>
             <ul className="small">
               <li><code>/add [title]</code> – add by title (disambiguation if multiple matches)</li>
-              <li><code>/add [title] by [artist]</code> – natural language format</li>
-              <li><code>/add [artist] - [title]</code> – dash-separated format</li>
+              <li><code>/bulkadd [title]</code> – show all matches for a title</li>
               <li><code>/add [artist]: [title]</code> – colon-separated format</li>
+              <li><code>/add [artist] - [title]</code> – dash-separated format</li>
+            </ul>
+            
+            <h6>Recommendations</h6>
+            <ul className="small">
+              <li><code>/auto</code> – get automatic recommendations based on current playlist</li>
+              <li>Or use natural language: "recommend 5 songs"</li>
             </ul>
             
             <h6>Managing Playlists</h6>
@@ -166,10 +182,11 @@ export default function PlaylistPanel() {
             <ul className="small">
               <li><code>/ask [question]</code> – ask about tracks or artists</li>
               <li>Examples: "what album is hey jude by the beatles on", "how many songs by queen"</li>
+              <li>Or use natural language without <code>/ask</code></li>
             </ul>
             
             <p className="text-muted small mb-0">
-              <strong>Note:</strong> Songs must exist in the database. Use <code>/preview</code> to search Spotify for tracks not in the database.
+              <strong>💡 Tip:</strong> Try natural language first! The system handles typos, word order, and special characters.
             </p>
           </div>
         </details>

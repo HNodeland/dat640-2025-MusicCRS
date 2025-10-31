@@ -7,6 +7,8 @@ Order of attempts:
 4) Build a 2x2 collage (Pillow). If Pillow isn't installed or downloads fail,
    fall back to returning the first image URL.
 5) Final fallback is a deterministic SVG.
+
+OPTIMIZATION: Results are cached in memory to avoid expensive HTTP requests.
 """
 
 from __future__ import annotations
@@ -20,6 +22,9 @@ from urllib.parse import quote
 import requests
 
 from .spotify_api import get_spotify_api
+
+# Cache for generated covers: (user_id, playlist_name, track_uris_hash) -> cover_url
+_cover_cache = {}
 
 
 # -------------------- helpers: fallback SVG -------------------- #
@@ -168,15 +173,29 @@ def _make_collage(urls: List[str], size: int = 512) -> Optional[str]:
 
 
 # -------------------- main API -------------------- #
-def generate_cover(user_id: str, playlist) -> str:
+def generate_cover(user_id: str, playlist, force_regenerate: bool = False) -> str:
     """Return a URL (or data: URL) for the playlist cover. Never raises.
 
     * Uses the first up to 4 tracks of the playlist.
     * Returns a real album cover as soon as you add the first song.
     * Collage (2x2) used when multiple covers are available (requires Pillow).
+    
+    OPTIMIZATION: Results are cached based on track URIs to avoid expensive regeneration.
+    Set force_regenerate=True to bypass cache (e.g., after bulk operations).
     """
     name = getattr(playlist, "name", "") or "Playlist"
     tracks = getattr(playlist, "tracks", None) or []
+
+    # Create a cache key based on the first 4 track URIs
+    track_uris = tuple(
+        getattr(t, "track_uri", "") or getattr(t, "uri", "")
+        for t in tracks[:4]
+    )
+    cache_key = (user_id, name, track_uris)
+    
+    # Check cache unless forced
+    if not force_regenerate and cache_key in _cover_cache:
+        return _cover_cache[cache_key]
 
     urls: List[str] = []
     seen = set()
@@ -200,10 +219,8 @@ def generate_cover(user_id: str, playlist) -> str:
 
     # Try to build a collage; if that fails but we have URLs, return the first URL
     collage = _make_collage(urls, size=512)
-    if collage:
-        return collage
-    if urls:
-        return urls[0]
-
-    # Final fallback
-    return _inline_svg_cover(name)
+    result = collage if collage else (urls[0] if urls else _inline_svg_cover(name))
+    
+    # Cache the result
+    _cover_cache[cache_key] = result
+    return result

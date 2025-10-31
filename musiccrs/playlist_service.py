@@ -6,9 +6,9 @@ from .playlist_db import (
     ensure_db,
     search_by_artist_title,
     get_track_by_uri,
-    search_by_title,
 )
 from .cover_art import generate_cover
+from .ir_search import search_tracks_ir, search_artist_title_ir
 
 
 @dataclass
@@ -95,22 +95,24 @@ class PlaylistService:
         uri, a, t, album = rows[0]
         return self._add_by_uri_internal(user_id, uri, a, t, album)
 
-    def add_by_uri(self, user_id: str, track_uri: str) -> Track:
+    def add_by_uri(self, user_id: str, track_uri: str, defer_cover: bool = False) -> Track:
         row = get_track_by_uri(track_uri)
         if not row:
             raise ValueError("Track URI not found in database.")
         uri, a, t, album = row
-        return self._add_by_uri_internal(user_id, uri, a, t, album)
+        return self._add_by_uri_internal(user_id, uri, a, t, album, defer_cover=defer_cover)
 
-    def _add_by_uri_internal(self, user_id: str, uri: str, artist: str, title: str, album: Optional[str]) -> Track:
+    def _add_by_uri_internal(self, user_id: str, uri: str, artist: str, title: str, album: Optional[str], defer_cover: bool = False) -> Track:
         pl = self.current_playlist(user_id)
         tr = Track(track_uri=uri, artist=artist, title=title, album=album)
         if any(x.track_uri == uri for x in pl.tracks):
-            # still refresh cover (e.g., first track after clear)
-            self._refresh_cover(user_id, pl.name)
+            # still refresh cover (e.g., first track after clear) unless deferred
+            if not defer_cover:
+                self._refresh_cover(user_id, pl.name)
             return tr
         pl.tracks.append(tr)
-        self._refresh_cover(user_id, pl.name)
+        if not defer_cover:
+            self._refresh_cover(user_id, pl.name)
         return tr
 
     def remove(self, user_id: str, identifier: str) -> Track:
@@ -139,33 +141,41 @@ class PlaylistService:
         self, user_id: str, title: str, fetch_all: bool = False, limit: int = 20
     ) -> List[Tuple[str, str, str, Optional[str]]]:
         """
+        Search tracks using IR-enhanced search for better ranking.
+        
         Ranked by:
-          1) whether artist already appears in current playlist,
-          2) MPD popularity (tracks.popularity),
-          3) artist/title alphabetical.
+          1) IR relevance score (token overlap)
+          2) whether artist already appears in current playlist
+          3) MPD popularity
         """
         self._ensure_user(user_id)
         pl = self.current_playlist(user_id)
         existing = set(t.artist.lower() for t in pl.tracks)
 
-        base_limit = 500 if fetch_all else max(20, limit)
-        rows = search_by_title(title, limit=base_limit)  # (uri, artist, title, album, popularity)
-        rows4 = [(r[0], r[1], r[2], r[3]) for r in rows]
-
-        # popularity map (rows already include popularity; keep robust)
-        pop_map: dict[str, int] = {}
-        if rows:
-            for r in rows:
-                pop_map[r[0]] = int(r[4] or 0)
-
-        def key(item):
-            uri, artist, title, album = item
-            in_pl = 1 if artist.lower() in existing else 0
-            pop = pop_map.get(uri, 0)
-            return (-in_pl, -pop, artist.lower(), title.lower())
-
-        rows_sorted = sorted(rows4, key=key)
-        return rows_sorted if fetch_all else rows_sorted[:limit]
+        # Use IR search for better results
+        conn = ensure_db()
+        base_limit = 100 if fetch_all else max(20, limit)
+        
+        try:
+            # IR search returns (uri, artist, title, album, score)
+            ir_results = search_tracks_ir(conn, title, limit=base_limit, min_score=0.2)
+        finally:
+            conn.close()
+        
+        # Convert to expected format and apply playlist-based ranking
+        scored_results = []
+        for uri, artist, track_title, album, ir_score in ir_results:
+            # Boost if artist already in playlist
+            in_playlist_boost = 0.2 if artist.lower() in existing else 0.0
+            final_score = ir_score + in_playlist_boost
+            scored_results.append((uri, artist, track_title, album, final_score))
+        
+        # Sort by final score
+        scored_results.sort(key=lambda x: x[4], reverse=True)
+        
+        # Return top results without scores
+        result_limit = 30 if fetch_all else limit
+        return [(uri, artist, title, album) for uri, artist, title, album, _ in scored_results[:result_limit]]
 
     def get_popularity(self, track_uri: str) -> int:
         con = ensure_db()
@@ -221,9 +231,18 @@ class PlaylistService:
         }
 
     # ---------- cover + payload ----------
-    def _refresh_cover(self, user_id: str, name: str):
+    def _refresh_cover(self, user_id: str, name: str, force: bool = False):
+        """Refresh cover art. Set force=True to regenerate even if cached."""
         pl = self._by_user[user_id][name]
-        pl.cover_url = generate_cover(user_id, pl)
+        # Only regenerate if forced or if cover doesn't exist
+        if force or not pl.cover_url:
+            pl.cover_url = generate_cover(user_id, pl, force_regenerate=force)
+    
+    def force_refresh_cover(self, user_id: str):
+        """Public method to force cover regeneration for current playlist."""
+        self._ensure_user(user_id)
+        current = self._current[user_id]
+        self._refresh_cover(user_id, current, force=True)
 
     def serialize_state(self, user_id: str) -> dict:
         """(Kept) full state — not used by the web UI parser, but available."""

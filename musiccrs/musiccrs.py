@@ -26,6 +26,7 @@ from dialoguekit.participant.agent import Agent
 
 from .playlist_service import PlaylistService
 from .qa_system import QASystem
+from .nl_handler import NaturalLanguageHandler, extract_song_artist
 
 load_dotenv()
 OLLAMA_HOST = os.getenv("OLLAMA_HOST")
@@ -63,9 +64,11 @@ class MusicCRS(Agent):
 
         self._ps = PlaylistService()
         self._qa = QASystem()
+        self._nl = NaturalLanguageHandler()
         self._user_key = "default"
 
         self._disambig: Optional[dict] = None  # {'query','rows','page','page_size'}
+        self._last_recommendations: Optional[List[dict]] = None  # Store last recommendations for R5.2
 
         # commands
         self._cmd_add_exact = re.compile(r"^/add\s+([^:]+)\s*:\s*(.+)$", re.IGNORECASE)
@@ -109,6 +112,11 @@ class MusicCRS(Agent):
                 if mnum:
                     self._handle_disambig_choice(int(mnum.group(1)))
                     return
+            
+            # R5: Natural language handling (if not a command)
+            if not text.startswith('/') and self._nl.is_natural_language(text):
+                self._handle_natural_language(text)
+                return
 
             if text.startswith("/info"):
                 self._send_text(self._info(), include_playlist=False)
@@ -190,13 +198,17 @@ class MusicCRS(Agent):
                 artist = m.group(1).strip()
                 title = m.group(2).strip()
                 track = self._ps.add_track_by_artist_title(self._user_key, artist, title)
+                # Note: add_track_by_artist_title doesn't support defer_cover, so refresh after
                 self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+                self._ps.force_refresh_cover(self._user_key)
                 return
 
             if m := self._cmd_add_any.match(text):
                 query = m.group(1).strip()
                 artist = None
                 title = None
+                
+                # Try explicit delimiters first
                 if ":" in query:
                     parts = query.split(":", 1)
                     if parts[0].strip() and parts[1].strip():
@@ -208,37 +220,103 @@ class MusicCRS(Agent):
                     parts = query.split(" - ", 1)
                     if len(parts) == 2:
                         artist, title = parts[0].strip(), parts[1].strip()
+                
+                # If no delimiter found, try title-only search first (R5 approach)
+                # Only attempt artist/title splitting if title search fails
+                if not (artist and title):
+                    # First, try as a complete title (most common case)
+                    title_rows = self._ps.search_tracks_by_title(self._user_key, query, fetch_all=True, limit=30)
+                    if title_rows:
+                        # Found results with title-only search - use them!
+                        if len(title_rows) == 1:
+                            uri, artist, title, album = title_rows[0]
+                            self._add_track_and_notify(uri, f"Added <b>{artist} – {title}</b>.")
+                            return
+                        else:
+                            self._start_disambiguation(query, title_rows)
+                            return
+                    
+                    # Title search found nothing - try artist/title splitting as fallback
+                    from .ir_search import search_artist_title_ir
+                    from .playlist_db import ensure_db
+                    words = query.split()
+                    if len(words) >= 2:
+                        # Try most likely split points first to minimize queries
+                        # For 2-3 words: try middle splits
+                        # For 4+ words: try 2-word artist first (common: "Kendrick Lamar")
+                        
+                        if len(words) == 2:
+                            # Try both: word1=artist word2=title, and word1=title word2=artist
+                            candidates = [
+                                (words[0], words[1]),
+                                (words[1], words[0])
+                            ]
+                        elif len(words) == 3:
+                            # Try: "word1 word2" + "word3", or "word1" + "word2 word3"
+                            candidates = [
+                                (" ".join(words[:2]), words[2]),
+                                (words[0], " ".join(words[1:])),
+                                (" ".join(words[1:]), words[0]),
+                                (words[2], " ".join(words[:2]))
+                            ]
+                        else:
+                            # For 4+ words, try multiple splits
+                            # Common patterns: "Title Artist" or "Artist Title"
+                            candidates = [
+                                # Try last word as artist, rest as title (common: "song name artist")
+                                (words[-1], " ".join(words[:-1])),
+                                # Try first word as artist, rest as title
+                                (words[0], " ".join(words[1:])),
+                                # Try last 2 words as artist, rest as title (common: "song Artist Name")
+                                (" ".join(words[-2:]), " ".join(words[:-2])),
+                                # Try first 2 words as artist, rest as title (common: "Artist Name song")
+                                (" ".join(words[:2]), " ".join(words[2:])),
+                                # Try middle splits
+                                (" ".join(words[:len(words)//2]), " ".join(words[len(words)//2:])),
+                                (" ".join(words[len(words)//2:]), " ".join(words[:len(words)//2]))
+                            ]
+                        
+                        # Try each candidate
+                        conn = ensure_db()
+                        try:
+                            for potential_artist, potential_title in candidates:
+                                fuzzy = search_artist_title_ir(conn, potential_artist, potential_title, limit=5)
+                                if fuzzy:
+                                    artist, title = potential_artist, potential_title
+                                    break
+                        finally:
+                            conn.close()
 
                 if artist and title:
-                    from .playlist_db import get_track, search_by_artist_title_fuzzy
+                    from .playlist_db import get_track, ensure_db
+                    from .ir_search import search_artist_title_ir
                     row = get_track(artist, title)
                     if row:
-                        track = self._ps.add_by_uri(self._user_key, row[0])
-                        self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+                        uri, a, t, album = row
+                        self._add_track_and_notify(uri, f"Added <b>{a} – {t}</b>.")
                         return
-                    fuzzy = search_by_artist_title_fuzzy(artist, title, limit=10)
+                    conn = ensure_db()
+                    try:
+                        fuzzy = search_artist_title_ir(conn, artist, title, limit=10)
+                    finally:
+                        conn.close()
                     if fuzzy:
                         if len(fuzzy) == 1:
-                            track = self._ps.add_by_uri(self._user_key, fuzzy[0][0])
-                            self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+                            uri, a, t, album = fuzzy[0]
+                            self._add_track_and_notify(uri, f"Added <b>{a} – {t}</b>.")
                         else:
                             self._start_disambiguation(f"{artist} - {title}", fuzzy)
                         return
+                    # Splitting failed - already tried title-only above, so nothing found
                     self._send_text(
-                        f"No tracks found with artist <b>{artist}</b> and title <b>{title}</b>.",
+                        f"No tracks found matching <b>{query}</b>.",
                         include_playlist=False,
                     )
                     return
-
-                title = query
-                full_rows = self._ps.search_tracks_by_title(self._user_key, title, fetch_all=True)
-                if not full_rows:
-                    self._send_text(f"No tracks found with title <b>{title}</b>.", include_playlist=False)
-                elif len(full_rows) == 1:
-                    track = self._ps.add_by_uri(self._user_key, full_rows[0][0])
-                    self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
-                else:
-                    self._start_disambiguation(title, full_rows)
+                
+                # No artist/title split attempted (single word or splitting disabled)
+                # This shouldn't happen since we try title-only first, but just in case
+                self._send_text(f"No tracks found matching <b>{query}</b>.", include_playlist=False)
                 return
 
             if m := self._cmd_remove.match(text):
@@ -250,7 +328,8 @@ class MusicCRS(Agent):
             if self._cmd_view.match(text):
                 pl = self._ps.current_playlist(self._user_key)
                 if pl.tracks:
-                    lines = "".join([f"<li>{i+1}. {t.artist} – {t.title}</li>" for i, t in enumerate(pl.tracks)])
+                    # Use <ol> which provides automatic numbering
+                    lines = "".join([f"<li>{t.artist} – {t.title}</li>" for t in pl.tracks])
                     html = f"Playlist <b>{pl.name}</b> ({len(pl.tracks)} tracks):<ol>{lines}</ol>"
                 else:
                     html = f"Playlist <b>{pl.name}</b> is empty."
@@ -314,6 +393,193 @@ class MusicCRS(Agent):
             )
         ]
         self._send_text("Here are some options:", include_playlist=False, dialogue_acts=dialogue_acts)
+    
+    def _handle_natural_language(self, text: str) -> None:
+        """
+        Handle natural language input (R5.1-R5.6).
+        Classifies intent and dispatches to appropriate handler.
+        """
+        intent = self._nl.classify_intent(text)
+        
+        if intent.confidence < 0.3:
+            # Low confidence: treat as general query or ask
+            self._send_text(
+                "I'm not sure what you want. Try <code>/help</code> for commands, or ask a specific question.",
+                include_playlist=False
+            )
+            return
+        
+        # Dispatch based on intent
+        if intent.intent_type == 'add_track':
+            self._handle_nl_add_track(intent)
+        elif intent.intent_type == 'remove_track':
+            self._handle_nl_remove_track(intent)
+        elif intent.intent_type == 'view_playlist':
+            self._handle_nl_view_playlist(intent)
+        elif intent.intent_type == 'clear_playlist':
+            self._handle_nl_clear_playlist(intent)
+        elif intent.intent_type == 'recommend':
+            self._handle_nl_recommend(intent)
+        elif intent.intent_type == 'ask_question':
+            self._handle_nl_ask(intent)
+        else:
+            self._send_text(
+                f"I understood you want to '{intent.intent_type}', but I'm not sure how to help. Try <code>/help</code>.",
+                include_playlist=False
+            )
+    
+    def _handle_nl_add_track(self, intent) -> None:
+        """Handle natural language track addition (R5.1, R5.3, R5.6)."""
+        entities = intent.entities
+        
+        # Check if we're responding to a recommendation (R5.2)
+        if self._last_recommendations:
+            selection = self._nl.parse_selection(intent.raw_text)
+            self._handle_nl_recommendation_selection(selection)
+            return
+        
+        # Extract title/artist from entities
+        if 'title' in entities and 'artist' in entities:
+            # Clear pattern: "add humble by kendrick"
+            from .playlist_db import ensure_db
+            from .ir_search import search_artist_title_ir
+            conn = ensure_db()
+            try:
+                fuzzy = search_artist_title_ir(conn, entities['artist'], entities['title'], limit=10)
+            finally:
+                conn.close()
+            if fuzzy:
+                if len(fuzzy) == 1:
+                    uri, artist, title, album = fuzzy[0]
+                    self._add_track_and_notify(uri, f"Added <b>{artist} – {title}</b>.")
+                else:
+                    self._start_disambiguation(f"{entities['artist']} - {entities['title']}", fuzzy)
+            else:
+                self._send_text(
+                    f"No tracks found matching <b>{entities['artist']} - {entities['title']}</b>.",
+                    include_playlist=False
+                )
+        elif 'query' in entities:
+            # General query: "add one dance"
+            query = entities['query']
+            full_rows = self._ps.search_tracks_by_title(self._user_key, query, fetch_all=True)
+            if not full_rows:
+                self._send_text(f"No tracks found matching <b>{query}</b>.", include_playlist=False)
+            elif len(full_rows) == 1:
+                uri, artist, title, album = full_rows[0]
+                self._add_track_and_notify(uri, f"Added <b>{artist} – {title}</b>.")
+            else:
+                self._start_disambiguation(query, full_rows)
+        else:
+            self._send_text("I couldn't understand which track to add. Try: 'add [song] by [artist]'", include_playlist=False)
+    
+    def _handle_nl_remove_track(self, intent) -> None:
+        """Handle natural language track removal (R5.1)."""
+        entities = intent.entities
+        
+        if 'track_number' in entities:
+            try:
+                track = self._ps.remove(self._user_key, str(entities['track_number']))
+                self._send_playlist_text(f"Removed <b>{track.artist} – {track.title}</b>.")
+            except Exception as e:
+                self._send_text(f"Error: {str(e)}", include_playlist=False)
+        elif 'query' in entities:
+            # Try to find track by name
+            query = entities['query']
+            pl = self._ps.current_playlist(self._user_key)
+            # Find matching track in playlist
+            for i, track in enumerate(pl.tracks, 1):
+                if query.lower() in track.title.lower() or query.lower() in track.artist.lower():
+                    removed = self._ps.remove(self._user_key, str(i))
+                    self._send_playlist_text(f"Removed <b>{removed.artist} – {removed.title}</b>.")
+                    return
+            self._send_text(f"No track matching <b>{query}</b> found in playlist.", include_playlist=False)
+        else:
+            self._send_text("I couldn't understand which track to remove. Try: 'remove track 3'", include_playlist=False)
+    
+    def _handle_nl_view_playlist(self, intent) -> None:
+        """Handle natural language playlist viewing (R5.1)."""
+        pl = self._ps.current_playlist(self._user_key)
+        if pl.tracks:
+            # Use <ol> which provides automatic numbering, no need for manual {i+1}
+            lines = "".join([f"<li>{t.artist} – {t.title}</li>" for t in pl.tracks])
+            html = f"Here's your playlist <b>{pl.name}</b> ({len(pl.tracks)} tracks):<ol>{lines}</ol>"
+        else:
+            html = f"Your playlist <b>{pl.name}</b> is empty."
+        self._send_playlist_text(html)
+    
+    def _handle_nl_clear_playlist(self, intent) -> None:
+        """Handle natural language playlist clearing (R5.1)."""
+        self._ps.clear(self._user_key)
+        self._send_playlist_text("Cleared your playlist.")
+    
+    def _handle_nl_recommend(self, intent) -> None:
+        """Handle natural language recommendation requests (R5.5)."""
+        entities = intent.entities
+        count = entities.get('count', 5)
+        count = max(1, min(10, count))  # Clamp to 1-10
+        
+        self._handle_recommend(limit=count)
+    
+    def _handle_nl_ask(self, intent) -> None:
+        """Handle natural language questions (R5.4)."""
+        # Use the existing /ask functionality
+        query = intent.raw_text
+        try:
+            result = self._qa.answer_question(query)
+            if result:
+                self._send_text(result, include_playlist=False)
+            else:
+                self._send_text("I don't have an answer for that question.", include_playlist=False)
+        except Exception as e:
+            self._send_text(f"Error: {str(e)}", include_playlist=False)
+    
+    def _handle_nl_recommendation_selection(self, selection: dict) -> None:
+        """Handle natural language selection from recommendations (R5.2)."""
+        if not self._last_recommendations:
+            self._send_text("No recommendations to select from. Use 'recommend' first.", include_playlist=False)
+            return
+        
+        tracks_to_add = []
+        
+        if selection['type'] == 'all':
+            tracks_to_add = self._last_recommendations
+        elif selection['type'] == 'range':
+            start, end = selection['start'], selection['end']
+            tracks_to_add = self._last_recommendations[start:end]
+        elif selection['type'] == 'index':
+            idx = selection['index']
+            if 0 <= idx < len(self._last_recommendations):
+                tracks_to_add = [self._last_recommendations[idx]]
+        elif selection['type'] == 'exclude_artist':
+            artist_to_exclude = selection['artist'].lower()
+            tracks_to_add = [
+                t for t in self._last_recommendations
+                if artist_to_exclude not in t['artist'].lower()
+            ]
+        
+        if not tracks_to_add:
+            self._send_text("No tracks match that selection.", include_playlist=False)
+            return
+        
+        # Add tracks
+        added_count = 0
+        for track_data in tracks_to_add:
+            try:
+                self._ps.add_by_uri(self._user_key, track_data['track_uri'], defer_cover=True)
+                added_count += 1
+            except Exception:
+                pass
+        
+        # Refresh cover once at the end
+        if added_count > 0:
+            self._ps.force_refresh_cover(self._user_key)
+            self._send_playlist_text(f"Added {added_count} track(s) to your playlist.")
+        else:
+            self._send_text("No tracks were added.", include_playlist=False)
+        
+        # Clear last recommendations
+        self._last_recommendations = None
 
     def _send_text(
         self,
@@ -335,6 +601,21 @@ class MusicCRS(Agent):
     def _send_playlist_text(self, text_html: str) -> None:
         acts = [DialogueAct(intent=_INTENT_INFORM)]
         self._send_text(text_html, include_playlist=True, dialogue_acts=acts)
+    
+    def _add_track_and_notify(self, track_uri: str, message: str) -> None:
+        """Add track, send notification, then refresh cover asynchronously.
+        
+        This ensures the user gets immediate feedback while cover generation
+        happens in the background without blocking the response.
+        """
+        # Add track without cover refresh (defer it)
+        track = self._ps.add_by_uri(self._user_key, track_uri, defer_cover=True)
+        
+        # Send immediate response
+        self._send_playlist_text(message)
+        
+        # Refresh cover after response is sent (non-blocking for user experience)
+        self._ps.force_refresh_cover(self._user_key)
 
     def _help_text(self) -> str:
         return (
@@ -435,9 +716,8 @@ class MusicCRS(Agent):
             return
 
         uri, artist, title, album = rows[idx0]
-        track = self._ps.add_by_uri(self._user_key, uri)
         self._disambig = None
-        self._send_playlist_text(f"Added <b>{track.artist} – {track.title}</b>.")
+        self._add_track_and_notify(uri, f"Added <b>{artist} – {title}</b>.")
 
     # ---- stats rendering ----
     def _format_stats(self, stats: dict) -> str:
@@ -533,9 +813,15 @@ class MusicCRS(Agent):
         """
         Add multiple tracks in one go. Payload is a newline- or '||'-separated list
         of 'Artist : Title' entries (no quotes).
+        
+        OPTIMIZED: 
+        - Reuses single database connection for all searches
+        - Uses exact match first, fallback to LIKE if needed
+        - Defers cover generation until all tracks are added
         """
         from html import escape as _e
         import re
+        from .playlist_db import ensure_db
 
         payload = (payload or "").strip()
         if not payload:
@@ -547,23 +833,58 @@ class MusicCRS(Agent):
         added = []
         errors = []
 
-        for p in parts:
-            if ":" not in p:
-                errors.append(p)
-                continue
-            artist, title = p.split(":", 1)
-            artist = artist.strip()
-            title = title.strip()
-            if not artist or not title:
-                errors.append(p)
-                continue
-            try:
-                track = self._ps.add_track_by_artist_title(self._user_key, artist, title)
-                added.append(f"{_e(track.artist)} – {_e(track.title)}")
-            except Exception:
-                errors.append(p)
+        # OPTIMIZATION: Use single database connection for all searches
+        conn = ensure_db()
+        try:
+            for p in parts:
+                if ":" not in p:
+                    errors.append(p)
+                    continue
+                artist, title = p.split(":", 1)
+                artist = artist.strip()
+                title = title.strip()
+                if not artist or not title:
+                    errors.append(p)
+                    continue
+                try:
+                    # OPTIMIZATION: Try exact match first (uses index efficiently)
+                    rows = conn.execute(
+                        """
+                        SELECT track_uri, artist, title, album
+                        FROM tracks
+                        WHERE LOWER(artist) = ? AND LOWER(title) = ?
+                        LIMIT 1
+                        """,
+                        (artist.lower(), title.lower()),
+                    ).fetchall()
+                    
+                    # Fallback to LIKE if exact match fails
+                    if not rows:
+                        rows = conn.execute(
+                            """
+                            SELECT track_uri, artist, title, album
+                            FROM tracks
+                            WHERE LOWER(artist) LIKE ? AND LOWER(title) LIKE ?
+                            LIMIT 1
+                            """,
+                            (f"%{artist.lower()}%", f"%{title.lower()}%"),
+                        ).fetchall()
+                    
+                    if rows:
+                        uri, a, t, album = rows[0]
+                        # Use internal method with defer_cover=True
+                        track = self._ps._add_by_uri_internal(self._user_key, uri, a, t, album, defer_cover=True)
+                        added.append(f"{_e(track.artist)} – {_e(track.title)}")
+                    else:
+                        errors.append(p)
+                except Exception:
+                    errors.append(p)
+        finally:
+            conn.close()
 
+        # OPTIMIZATION: Generate cover ONCE after all tracks are added
         if added:
+            self._ps.force_refresh_cover(self._user_key)
             self._send_playlist_text("Added: " + ", ".join(f"<b>{s}</b>" for s in added))
         if errors:
             self._send_text("Couldn't add: " + ", ".join(_e(e) for e in errors))
@@ -722,6 +1043,9 @@ class MusicCRS(Agent):
         if not recs:
             self._send_text("I couldn't find related tracks right now.")
             return
+        
+        # Store for R5.2 (natural language selection)
+        self._last_recommendations = recs
 
         items_html_list = []
         for i, r in enumerate(recs[:limit], start=1):
@@ -919,7 +1243,7 @@ class MusicCRS(Agent):
             self._send_text("Sorry, I couldn't create a new playlist in this environment.")
             return
 
-        # add with artist diversity (≤2 per artist)
+        # OPTIMIZATION: Add tracks with deferred cover generation
         add_by_uri = self._ps.add_by_uri
         artist_counts = {}
         added = 0
@@ -932,7 +1256,8 @@ class MusicCRS(Agent):
             if not a or not t or not artist_ok(a):
                 continue
             try:
-                add_by_uri(self._user_key, uri)
+                # CRITICAL: defer_cover=True to skip expensive HTTP requests during bulk add
+                add_by_uri(self._user_key, uri, defer_cover=True)
                 artist_counts[a] = artist_counts.get(a, 0) + 1
                 added += 1
             except Exception:
@@ -944,13 +1269,16 @@ class MusicCRS(Agent):
             self._send_text(f"I couldn't assemble a playlist from: <b>{_e(q)}</b>.")
             return
 
+        # OPTIMIZATION: Generate cover ONCE after all tracks are added
+        self._ps.force_refresh_cover(self._user_key)
+
         blurb = ""
         if mpd_names:
             show = ", ".join(_e(n) for n in mpd_names[:3])
             blurb = f"<br/><span class='text-muted'>Inspired by MPD playlists like: {show}</span>"
 
         self._send_playlist_text(
-            f"Created <b>{_e(name)}</b> — {added} songs, from playlists matching “{_e(q)}”.{blurb}"
+            f"Created <b>{_e(name)}</b> — {added} songs, from playlists matching \"{_e(q)}\".{blurb}"
         )
 
 
