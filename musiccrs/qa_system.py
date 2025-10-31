@@ -7,10 +7,10 @@ from typing import Optional, List, Tuple, Dict
 from .playlist_db import (
     ensure_db,
     get_track,
-    search_by_title,
     search_by_artist_title,
     count_tracks_by_artist,
 )
+from .ir_search import search_tracks_ir
 
 
 def _clean_text(s: str) -> str:
@@ -297,10 +297,14 @@ class QASystem:
                 return "I didn't find an exact match. Did you mean:<br/>" + "<br/>".join(opts)
             return f"I couldn't find “{title}” by {artist}."
 
-        # Fallback: treat as a title and suggest up to 5
-        rows = search_by_title(_clean_text(q), limit=5)
-        if rows:
-            lis = [f"{r[1]} – {r[2]} ({r[3] or 'single'})" for r in rows]
+        # Fallback: treat as a title and suggest up to 5 using IR search
+        conn = ensure_db()
+        try:
+            ir_results = search_tracks_ir(conn, _clean_text(q), limit=5, min_score=0.2)
+        finally:
+            conn.close()
+        if ir_results:
+            lis = [f"{r[1]} – {r[2]} ({r[3] or 'single'})" for r in ir_results]
             return "Did you mean:<br/>" + "<br/>".join(lis)
 
         return "Sorry, I couldn't answer that from the database."

@@ -79,33 +79,6 @@ def search_by_artist_title(artist: str, title: str, limit: int = 20, conn: Optio
         conn.close()
     return [tuple(r) for r in rows]
 
-def search_by_artist_title_fuzzy(artist: str, title: str, limit: int = 20, conn: Optional[sqlite3.Connection] = None) -> List[Tuple]:
-    """Basic fuzzy by LIKE on both fields."""
-    return search_by_artist_title(artist, title, limit=limit, conn=conn)
-
-def search_by_title(title: str, limit: int = 50, conn: Optional[sqlite3.Connection] = None) -> List[Tuple]:
-    close = False
-    if conn is None:
-        conn = ensure_db()
-        close = True
-    rows = conn.execute(
-        """
-        SELECT track_uri, artist, title, album, COALESCE(popularity,0) AS popularity
-        FROM tracks
-        WHERE LOWER(title) LIKE ?
-        LIMIT ?
-        """,
-        (f"%{title.lower()}%", limit),
-    ).fetchall()
-    if close:
-        conn.close()
-    return [tuple(r) for r in rows]
-
-def search_by_title_ranked(title: str, limit: int = 20, conn: Optional[sqlite3.Connection] = None) -> List[Tuple[str,str,str,Optional[str]]]:
-    """Thin wrapper preserved for compatibility: relies on DB, not Spotify."""
-    rows = search_by_title(title, limit=limit, conn=conn)
-    return [(r[0], r[1], r[2], r[3]) for r in rows[:limit]]
-
 # ---------- artist & stats helpers ----------
 def count_tracks_by_artist(artist: str, conn: Optional[sqlite3.Connection] = None) -> int:
     close = False

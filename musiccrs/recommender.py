@@ -61,32 +61,58 @@ def recommend_by_cooccurrence(
     seed_uris: Iterable[str],
     *,
     limit: int = 5,
-    # ===== aggressive speed knobs =====
-    max_seeds: int = 100,                  # consider at most this many seeds from the user's playlist
-    rare_seed_sample: int = 48,            # use the K rarest seeds to find matching playlists
-    min_seed_hits_per_playlist: int = 2,   # playlists must match at least k of those seeds
-    pid_cap: int = 1000,                   # *** FIRST PASS HARD CAP: keep top 1,000 playlists by hits ***
-    min_co: int = 2,                       # candidate must appear in at least this many matched playlists
-    cand_cap: int = 3000,                  # rank only the top-N candidates by weighted co-occurrence
-    timeout_seconds: float = 9.0,
+    max_seeds: int = 100,
+    rare_seed_sample: Optional[int] = None,
+    min_seed_hits_per_playlist: Optional[int] = None,
+    pid_cap: Optional[int] = None,
+    min_co: int = 1,
+    cand_cap: int = 1500,
+    timeout_seconds: float = 5.0,
     con: Optional[sqlite3.Connection] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Ultra-fast, read-only, set-weighted playlist co-occurrence recommender.
-
-    1) Choose the K rarest seeds (by global playlist frequency) from the user's playlist.
-    2) Find playlists that contain >= min_seed_hits_per_playlist of those seeds; keep **top pid_cap (1,000)** by hits.
-    3) Score candidates by weighted co-occurrence (sum of hits across matched playlists).
-    4) Trim to top cand_cap candidates, then enrich (track meta + normalization) and rank.
-    5) Return 3–5 diversified picks.
-
-    All operations are read-only on the main DB; TEMP tables are in memory.
+    Playlist co-occurrence recommender with adaptive parameters.
+    
+    Parameters scale based on seed playlist size:
+    - Small playlists (2-5 tracks) use tighter filtering
+    - Larger playlists cast a wider net
+    
+    All operations are read-only; TEMP tables are in memory.
     """
     t0 = time()
-    limit = max(3, min(5, int(limit or 5)))
+    limit = max(1, min(10, int(limit or 5)))
     seeds_all = _normalize_seeds(seed_uris, max_seeds=max_seeds)
+    seed_count = len(seeds_all)
+    
     if not seeds_all:
         return []
+
+    # Adaptive parameters based on playlist size
+    if rare_seed_sample is None:
+        if seed_count <= 5:
+            rare_seed_sample = seed_count
+        elif seed_count <= 15:
+            rare_seed_sample = min(seed_count, 12)
+        else:
+            rare_seed_sample = min(seed_count, 24)
+    
+    if min_seed_hits_per_playlist is None:
+        if seed_count <= 3:
+            min_seed_hits_per_playlist = 1
+        elif seed_count <= 10:
+            min_seed_hits_per_playlist = max(1, seed_count // 4)
+        else:
+            min_seed_hits_per_playlist = max(2, seed_count // 5)
+    
+    if pid_cap is None:
+        if seed_count <= 5:
+            pid_cap = 150
+        elif seed_count <= 15:
+            pid_cap = 300
+        elif seed_count <= 30:
+            pid_cap = 500
+        else:
+            pid_cap = 800
 
     owned_con = False
     if con is None:
@@ -103,12 +129,11 @@ def recommend_by_cooccurrence(
         idx_hint_track = f"INDEXED BY {idx_pt_track}" if idx_pt_track else ""
         idx_hint_pid   = f"INDEXED BY {idx_pt_pid}" if idx_pt_pid else ""
 
-        # TEMP: all seeds
         cur.execute("CREATE TEMP TABLE IF NOT EXISTS seeds (track_uri TEXT PRIMARY KEY) WITHOUT ROWID")
         cur.execute("DELETE FROM seeds")
         cur.executemany("INSERT INTO seeds(track_uri) VALUES (?)", [(s,) for s in seeds_all])
 
-        # Global playlist frequency for our seeds -> pick rarest K
+        # Global playlist frequency for our seeds
         cur.execute("""
             CREATE TEMP TABLE IF NOT EXISTS seed_counts (
                 track_uri TEXT PRIMARY KEY,
@@ -124,6 +149,22 @@ def recommend_by_cooccurrence(
             GROUP BY s.track_uri
         """)
 
+        # Check if we have extremely popular seeds
+        max_seed_pop = cur.execute("SELECT MAX(cnt) FROM seed_counts").fetchone()[0]
+        
+        # For mega-popular tracks, we need a completely different strategy
+        # These tracks appear in so many playlists that normal filtering doesn't work
+        use_fast_path = seed_count <= 10 and max_seed_pop < 10000
+        use_mega_popular_path = seed_count <= 20 and max_seed_pop >= 10000
+        
+        # Adjust parameters for very popular tracks
+        if max_seed_pop >= 10000:
+            # For mega-hits, we need to sample playlists very aggressively
+            rare_seed_sample = min(rare_seed_sample, max(2, seed_count // 2))
+            pid_cap = min(pid_cap, 500)  # Need more playlists for mega-popular tracks
+            # For mega-popular, allow single seed matches (tracks rarely co-occur)
+            min_seed_hits_per_playlist = 1
+
         cur.execute("""
             CREATE TEMP TABLE IF NOT EXISTS seed_work (
                 track_uri TEXT PRIMARY KEY
@@ -138,7 +179,207 @@ def recommend_by_cooccurrence(
             LIMIT ?
         """, (rare_seed_sample,))
 
+        # FAST PATH: For small playlists with moderately popular tracks, use direct co-occurrence
+        # This bypasses the playlist aggregation step entirely
+        if use_fast_path:
+            # Define to_fetch for this path
+            to_fetch = min(cand_cap, limit * 20)  # Fetch enough to account for artist deduplication
+            
+            # Clean up any existing temp tables first
+            cur.execute("DROP TABLE IF EXISTS quick_candidates")
+            
+            # Direct approach: Find tracks that co-occur with our seeds
+            cur.execute(f"""
+                CREATE TEMP TABLE quick_candidates AS
+                SELECT 
+                    pt2.track_uri,
+                    COUNT(DISTINCT pt2.pid) as co_count,
+                    SUM(CASE 
+                        WHEN pt1.track_uri IN (SELECT track_uri FROM seed_work LIMIT 1) THEN 3
+                        WHEN pt1.track_uri IN (SELECT track_uri FROM seed_work) THEN 2
+                        ELSE 1
+                    END) as w_co
+                FROM playlist_tracks pt1 {idx_hint_track}
+                JOIN seed_work sw ON sw.track_uri = pt1.track_uri
+                JOIN playlist_tracks pt2 {idx_hint_pid} ON pt2.pid = pt1.pid
+                WHERE pt2.track_uri NOT IN (SELECT track_uri FROM seeds)
+                  AND pt1.pid IN (
+                      SELECT DISTINCT pid 
+                      FROM playlist_tracks 
+                      WHERE track_uri IN (SELECT track_uri FROM seed_work)
+                      LIMIT {pid_cap * 2}
+                  )
+                GROUP BY pt2.track_uri
+                HAVING co_count >= {min_co}
+                ORDER BY w_co DESC, co_count DESC
+                LIMIT {cand_cap}
+            """)
+            
+            # Get results with track metadata
+            rows = cur.execute("""
+                SELECT
+                    qc.track_uri,
+                    t.artist, t.title, t.album, t.popularity,
+                    qc.w_co,
+                    qc.co_count,
+                    ? AS seed_pid_count,
+                    ? AS seed_weight_total,
+                    qc.co_count AS track_pid_count,
+                    CAST(qc.w_co AS FLOAT) / ? AS norm_w_score
+                FROM quick_candidates qc
+                JOIN tracks t ON t.track_uri = qc.track_uri
+                ORDER BY norm_w_score DESC, qc.w_co DESC
+                LIMIT ?
+            """, (seed_count, seed_count * 10, max(1, seed_count * 10), to_fetch)).fetchall()
+            
+            seen_artists = set()
+            picks: List[RecCandidate] = []
+            for r in rows:
+                if time() - t0 > timeout_seconds:
+                    break
+                a = (r["artist"] or "").strip().lower()
+                if a in seen_artists:
+                    continue
+                seen_artists.add(a)
+                picks.append(
+                    RecCandidate(
+                        track_uri=r["track_uri"],
+                        artist=r["artist"],
+                        title=r["title"],
+                        album=r["album"],
+                        popularity=r["popularity"],
+                        w_co=r["w_co"],
+                        co_count=r["co_count"],
+                        seed_pid_count=r["seed_pid_count"],
+                        seed_weight_total=r["seed_weight_total"],
+                        track_pid_count=r["track_pid_count"],
+                        score=r["norm_w_score"],
+                    )
+                )
+                if len(picks) >= limit:
+                    break
+            
+            elapsed = time() - t0
+            return [
+                {
+                    "track_uri": c.track_uri,
+                    "artist": c.artist,
+                    "title": c.title,
+                    "album": c.album,
+                    "score": c.score,
+                    "w_co": c.w_co,
+                    "co_count": c.co_count,
+                }
+                for c in picks
+            ]
+
+        # MEGA-POPULAR FAST PATH: For extremely popular tracks (10k+ playlists)
+        # Sample playlists more aggressively and require multiple seed hits
+        if use_mega_popular_path:
+            # Define to_fetch for this path
+            to_fetch = min(cand_cap, limit * 20)
+            
+            # Clean up any existing temp tables first
+            cur.execute("DROP TABLE IF EXISTS mega_popular_pids")
+            cur.execute("DROP TABLE IF EXISTS quick_candidates")
+            
+            # For mega-popular tracks, find playlists that contain MULTIPLE seeds
+            # This dramatically reduces the search space
+            cur.execute(f"""
+                CREATE TEMP TABLE mega_popular_pids AS
+                SELECT pt.pid, COUNT(DISTINCT pt.track_uri) as seed_hit_count
+                FROM playlist_tracks pt {idx_hint_track}
+                JOIN seed_work sw ON sw.track_uri = pt.track_uri
+                GROUP BY pt.pid
+                HAVING seed_hit_count >= {min_seed_hits_per_playlist}
+                ORDER BY seed_hit_count DESC
+                LIMIT {pid_cap}
+            """)
+            
+            # Now find co-occurring tracks in these playlists
+            cur.execute(f"""
+                CREATE TEMP TABLE quick_candidates AS
+                SELECT 
+                    pt.track_uri,
+                    COUNT(DISTINCT pt.pid) as co_count,
+                    SUM(mpp.seed_hit_count) as w_co
+                FROM mega_popular_pids mpp
+                JOIN playlist_tracks pt {idx_hint_pid} ON pt.pid = mpp.pid
+                WHERE pt.track_uri NOT IN (SELECT track_uri FROM seeds)
+                GROUP BY pt.track_uri
+                HAVING co_count >= {min_co}
+                ORDER BY w_co DESC, co_count DESC
+                LIMIT {cand_cap}
+            """)
+            
+            # Get results with track metadata
+            rows = cur.execute("""
+                SELECT
+                    qc.track_uri,
+                    t.artist, t.title, t.album, t.popularity,
+                    qc.w_co,
+                    qc.co_count,
+                    ? AS seed_pid_count,
+                    ? AS seed_weight_total,
+                    qc.co_count AS track_pid_count,
+                    CAST(qc.w_co AS FLOAT) / CAST(? AS FLOAT) AS norm_w_score
+                FROM quick_candidates qc
+                JOIN tracks t ON t.track_uri = qc.track_uri
+                ORDER BY norm_w_score DESC, qc.w_co DESC
+                LIMIT ?
+            """, (seed_count, seed_count * 10, max(1, seed_count * 10), to_fetch)).fetchall()
+            
+            seen_artists = set()
+            picks: List[RecCandidate] = []
+            for r in rows:
+                if time() - t0 > timeout_seconds:
+                    break
+                a = (r["artist"] or "").strip().lower()
+                if a in seen_artists:
+                    continue
+                seen_artists.add(a)
+                picks.append(
+                    RecCandidate(
+                        track_uri=r["track_uri"],
+                        artist=r["artist"],
+                        title=r["title"],
+                        album=r["album"],
+                        popularity=r["popularity"],
+                        w_co=r["w_co"],
+                        co_count=r["co_count"],
+                        seed_pid_count=seed_count,
+                        seed_weight_total=seed_count * 10,
+                        track_pid_count=r["track_pid_count"],
+                        score=float(r["norm_w_score"]),
+                    )
+                )
+                if len(picks) >= limit:
+                    break
+            
+            # Return early with fast results
+            out: List[Dict[str, Any]] = []
+            for r in picks:
+                out.append({
+                    "track_uri": r.track_uri,
+                    "artist": r.artist,
+                    "title": r.title,
+                    "album": r.album,
+                    "popularity": r.popularity,
+                    "weighted_overlap": r.w_co,
+                    "contributing_playlists": r.co_count,
+                    "num_matched_playlists": r.seed_pid_count,
+                    "total_seed_hits": r.seed_weight_total,
+                    "num_track_playlists": r.track_pid_count,
+                    "score": round(r.score, 6),
+                    "reason": (
+                        f"Strong set overlap: weighted co-occurrence {r.w_co} "
+                        f"across {r.co_count} highly-matching playlists"
+                    ),
+                })
+            return out
+
         # 1) Overlapping playlists, count how many rare seeds they contain
+        # CRITICAL OPTIMIZATION: Add LIMIT much earlier to avoid scanning too many rows
         cur.execute("""
             CREATE TEMP TABLE IF NOT EXISTS pid_seed_hits (
                 pid   INTEGER PRIMARY KEY,
@@ -146,15 +387,20 @@ def recommend_by_cooccurrence(
             ) WITHOUT ROWID
         """)
         cur.execute("DELETE FROM pid_seed_hits")
+        
+        # Use a subquery with LIMIT to restrict the initial scan
         cur.execute(f"""
             INSERT INTO pid_seed_hits(pid, hits)
-            SELECT pt.pid, COUNT(*) AS hits
-            FROM playlist_tracks pt {idx_hint_track}
-            JOIN seed_work sw ON sw.track_uri = pt.track_uri
-            GROUP BY pt.pid
-            HAVING hits >= ?
-            ORDER BY hits DESC
-            LIMIT ?
+            SELECT pid, hits
+            FROM (
+                SELECT pt.pid, COUNT(*) AS hits
+                FROM playlist_tracks pt {idx_hint_track}
+                JOIN seed_work sw ON sw.track_uri = pt.track_uri
+                GROUP BY pt.pid
+                HAVING hits >= ?
+                ORDER BY hits DESC
+                LIMIT ?
+            )
         """, (min_seed_hits_per_playlist, pid_cap))
 
         row = cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(hits),0) AS w FROM pid_seed_hits").fetchone()
@@ -218,8 +464,14 @@ def recommend_by_cooccurrence(
             GROUP BY pt.track_uri
         """)
 
-        # 5) Rank & fetch a bit extra, then diversify by artist
-        to_fetch = max(16, limit * 12)
+        # 5) Rank & fetch adaptively - small playlists need fewer candidates
+        if seed_count <= 5:
+            to_fetch = max(8, limit * 4)  # Much smaller for tiny playlists
+        elif seed_count <= 15:
+            to_fetch = max(12, limit * 6)
+        else:
+            to_fetch = max(16, limit * 8)  # Reduced from 12x
+        
         rows = cur.execute("""
             SELECT
                 c.track_uri,
@@ -235,11 +487,15 @@ def recommend_by_cooccurrence(
             JOIN tracks t            ON t.track_uri   = c.track_uri
             ORDER BY norm_w_score DESC, c.w_co DESC, c.co_count DESC, COALESCE(t.popularity,0) DESC
             LIMIT ?
-        """, (seed_pid_count, seed_weight_total, seed_weight_total, to_fetch)).fetchall()
+        """, (seed_pid_count, seed_weight_total, max(1, seed_weight_total), to_fetch)).fetchall()
 
         seen_artists = set()
         picks: List[RecCandidate] = []
         for r in rows:
+            # Check timeout early
+            if time() - t0 > timeout_seconds:
+                break
+                
             a = (r["artist"] or "").strip().lower()
             if a in seen_artists:
                 continue
