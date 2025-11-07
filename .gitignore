@@ -9,3 +9,4 @@ export.sh
 project.zip
 .env
 static/
+.pytest_cache/

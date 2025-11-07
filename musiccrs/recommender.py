@@ -521,6 +521,8 @@ def recommend_by_cooccurrence(
         if time() - t0 > timeout_seconds:
             picks = picks[:max(3, limit)]
 
+        elapsed_ms = (time() - t0) * 1000
+        
         out: List[Dict[str, Any]] = []
         for r in picks:
             out.append(
@@ -540,6 +542,7 @@ def recommend_by_cooccurrence(
                         f"Strong set overlap: weighted co-occurrence {r.w_co} "
                         f"across {r.co_count} highly-matching playlists"
                     ),
+                    "latency_ms": elapsed_ms,  # Add timing info
                 }
             )
         return out

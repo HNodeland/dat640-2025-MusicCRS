@@ -31,8 +31,8 @@ class Playlist:
     tracks: List[Track] = field(default_factory=list)
     cover_url: Optional[str] = None  # internal preferred name
 
-    def to_public(self) -> dict:
-        cover = self.cover_url or ""
+    def to_public(self, exclude_cover: bool = False) -> dict:
+        cover = "" if exclude_cover else (self.cover_url or "")
         return {
             "name": self.name,
             "tracks": [t.to_public() for t in self.tracks],
@@ -256,7 +256,7 @@ class PlaylistService:
             "playlists_by_name": by_name,
         }
 
-    def serialize_current_playlist(self, user_id: str) -> dict:
+    def serialize_current_playlist(self, user_id: str, exclude_cover: bool = False) -> dict:
         """Single playlist object — exactly what the web UI expects in <!--PLAYLIST:{...}-->."""
         self._ensure_user(user_id)
-        return self.current_playlist(user_id).to_public()
+        return self.current_playlist(user_id).to_public(exclude_cover=exclude_cover)
